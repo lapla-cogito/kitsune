@@ -230,3 +230,7 @@ echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 
 curl -I example.com
 ```
+
+## License
+
+MIT
