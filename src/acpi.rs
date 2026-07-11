@@ -1,8 +1,10 @@
-//! Minimal ACPI tables so modern kernels can discover virtio-mmio devices.
+//! ACPI tables for IOAPIC, serial (COM1), and optional virtio-mmio.
 //!
-//! Recent Firecracker-style kernels ship without
-//! `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES`, so `virtio_mmio.device=` is ignored.
-//! Those kernels enumerate `LNRO0005` devices from the DSDT instead.
+//! Without MADT/IOAPIC the guest stays in virtual-wire mode and never
+//! receives irqfd-injected GSIs, so the serial console cannot accept input.
+//! COM1 is described in the DSDT for HwReducedAcpi. Virtio-mmio devices
+//! (LNRO0005) are listed when a block device is present; modern kernels
+//! without `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` rely on that path.
 
 use acpi_tables::Aml as _;
 use vm_memory::GuestMemoryBackend as _;
@@ -49,6 +51,9 @@ pub fn install_tables(
 
     // --- DSDT (AML body) -------------------------------------------------
     let mut aml = Vec::new();
+    // COM1 is required under HwReducedAcpi so userspace can use the 16550
+    // (kernel printk still works via the polled console path alone).
+    append_com1_device(&mut aml);
     for dev in virtio_devices {
         append_virtio_mmio_device(&mut aml, dev);
     }
@@ -60,6 +65,8 @@ pub fn install_tables(
     cursor += align_up(dsdt.len() as u64, 16);
 
     // --- FADT ------------------------------------------------------------
+    // HwReducedAcpi is required for this kernel's virtio-mmio (LNRO0005) path;
+    // without it the block device is not discovered.
     let fadt = acpi_tables::fadt::FADTBuilder::new(OEM_ID, OEM_TABLE_ID, OEM_REVISION)
         .dsdt_64(dsdt_addr)
         .flag(acpi_tables::fadt::Flags::HwReducedAcpi)
@@ -109,28 +116,46 @@ pub fn install_tables(
     Ok(rsdp_addr)
 }
 
-fn append_virtio_mmio_device(out: &mut Vec<u8>, dev: &VirtioMmioAcpi) {
-    use acpi_tables::aml::{
-        AmlStr, Device, Interrupt, Memory32Fixed, Name, ONE, Path, ResourceTemplate,
-    };
+fn append_com1_device(out: &mut Vec<u8>) {
+    // PNP0501 = 16550A-compatible COM port (ISA COM1 @ 0x3f8, IRQ 4).
+    let hid = acpi_tables::aml::EISAName::new("PNP0501");
+    // Edge, active-high, exclusive (classic ISA serial).
+    let irq =
+        acpi_tables::aml::Interrupt::new(true, true, false, false, crate::devices::SERIAL_IRQ);
+    let io = acpi_tables::aml::IO::new(0x3f8, 0x3f8, 0, 0x8);
+    let crs = acpi_tables::aml::ResourceTemplate::new(vec![&irq, &io]);
 
+    let hid_name = acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("_HID"), &hid);
+    let crs_name = acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("_CRS"), &crs);
+
+    acpi_tables::aml::Device::new(
+        acpi_tables::aml::Path::new("_SB_.COM1"),
+        vec![&hid_name, &crs_name],
+    )
+    .to_aml_bytes(out);
+}
+
+fn append_virtio_mmio_device(out: &mut Vec<u8>, dev: &VirtioMmioAcpi) {
     // Each ACPI name segment must be exactly 4 characters.
     let name = format!("_SB_.V{:03X}", dev.uid);
-    let path = Path::new(&name);
+    let path = acpi_tables::aml::Path::new(&name);
 
-    let hid: AmlStr = "LNRO0005";
+    let hid: acpi_tables::aml::AmlStr = "LNRO0005";
     let uid = dev.uid;
-    let mem32 = Memory32Fixed::new(true, dev.base, dev.size);
-    // Level, active-high, exclusive (matches Firecracker).
-    let irq = Interrupt::new(true, true, false, false, dev.irq);
-    let crs = ResourceTemplate::new(vec![&mem32, &irq]);
+    let mem32 = acpi_tables::aml::Memory32Fixed::new(true, dev.base, dev.size);
+    // Edge, active-high, exclusive (matches Firecracker virtio-mmio).
+    // Interrupt::new(consumer, edge_triggered, active_low, shared, gsi)
+    let irq = acpi_tables::aml::Interrupt::new(true, true, false, false, dev.irq);
+    let crs = acpi_tables::aml::ResourceTemplate::new(vec![&mem32, &irq]);
 
-    let hid_name = Name::new(Path::new("_HID"), &hid);
-    let uid_name = Name::new(Path::new("_UID"), &uid);
-    let cca_name = Name::new(Path::new("_CCA"), &ONE);
-    let crs_name = Name::new(Path::new("_CRS"), &crs);
+    let hid_name = acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("_HID"), &hid);
+    let uid_name = acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("_UID"), &uid);
+    let cca_name =
+        acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("_CCA"), &acpi_tables::aml::ONE);
+    let crs_name = acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("_CRS"), &crs);
 
-    Device::new(path, vec![&hid_name, &uid_name, &cca_name, &crs_name]).to_aml_bytes(out);
+    acpi_tables::aml::Device::new(path, vec![&hid_name, &uid_name, &cca_name, &crs_name])
+        .to_aml_bytes(out);
 }
 
 fn write_bytes(
