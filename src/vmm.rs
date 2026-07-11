@@ -8,9 +8,10 @@ use vm_memory::bytes::Bytes as _;
 pub struct Vmm {
     _kvm: kvm_ioctls::Kvm,
     guest_mem: vm_memory::GuestMemoryMmap<()>,
-    _vm: kvm_ioctls::VmFd,
+    vm: kvm_ioctls::VmFd,
     vcpu: kvm_ioctls::VcpuFd,
     serial: crate::devices::SerialConsole,
+    block: Option<crate::devices::VirtioBlock>,
 }
 
 impl Vmm {
@@ -53,10 +54,22 @@ impl Vmm {
         Ok(Self {
             _kvm: kvm,
             guest_mem,
-            _vm: vm,
+            vm,
             vcpu,
             serial: crate::devices::SerialConsole::new(),
+            block: None,
         })
+    }
+
+    /// Attach a virtio-blk device backed by the given host path.
+    pub fn add_block_device(&mut self, path: &std::path::Path) -> crate::error::Result<()> {
+        if self.block.is_some() {
+            return Err(crate::error::Error::Block(
+                "only one block device is supported".into(),
+            ));
+        }
+        self.block = Some(crate::devices::VirtioBlock::new(path, &self.vm)?);
+        Ok(())
     }
 
     /// Load a flat binary into guest memory and set the real-mode entry point.
@@ -89,6 +102,18 @@ impl Vmm {
         &mut self,
         config: &crate::boot::KernelBootConfig<'_>,
     ) -> crate::error::Result<()> {
+        // Modern kernels (without CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES) discover
+        // virtio-mmio via ACPI LNRO0005 devices in the DSDT.
+        if self.block.is_some() {
+            let devices = [crate::acpi::VirtioMmioAcpi {
+                base: crate::devices::VirtioBlock::MMIO_BASE as u32,
+                size: 0x1000,
+                irq: crate::devices::VirtioBlock::IRQ,
+                uid: 0,
+            }];
+            crate::acpi::install_tables(&self.guest_mem, &devices)?;
+        }
+
         let entry = crate::boot::load_linux(&self.guest_mem, config)?;
         crate::vcpu::setup_long_mode(&self.vcpu, &self.guest_mem, entry)?;
         Ok(())
@@ -116,6 +141,21 @@ impl Vmm {
                         self.serial.bus_read(port, data);
                     } else {
                         data.fill(0xff);
+                    }
+                }
+                kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
+                    if let Some(block) = self.block.as_ref()
+                        && block.handles(addr)
+                    {
+                        block.read(addr, data);
+                    }
+                }
+                kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
+                    if let Some(block) = self.block.as_mut()
+                        && block.handles(addr)
+                    {
+                        let mem = &self.guest_mem;
+                        block.write(addr, data, mem)?;
                     }
                 }
                 kvm_ioctls::VcpuExit::Hlt | kvm_ioctls::VcpuExit::Shutdown => break,

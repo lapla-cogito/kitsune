@@ -17,6 +17,10 @@ enum Command {
         #[arg(long, requires = "kernel")]
         initrd: Option<std::path::PathBuf>,
 
+        /// Raw disk image exposed as virtio-blk (/dev/vda)
+        #[arg(long, requires = "kernel")]
+        block: Option<std::path::PathBuf>,
+
         /// Kernel command line
         #[arg(long, default_value = kitsune::DEFAULT_KERNEL_CMDLINE)]
         cmdline: String,
@@ -52,6 +56,7 @@ fn run(cli: Cli) -> kitsune::Result<()> {
         Command::Run {
             kernel,
             initrd,
+            block,
             cmdline,
             flat_binary,
             memory,
@@ -75,12 +80,29 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             };
             let mut vmm = kitsune::Vmm::new(&config)?;
 
+            if let Some(block) = block.as_ref() {
+                vmm.add_block_device(block)?;
+            }
+
             if let Some(kernel) = kernel {
                 let mut cmdline = cmdline;
                 if initrd.is_some() && !cmdline.split_whitespace().any(|t| t.starts_with("rdinit="))
                 {
                     cmdline.push(' ');
                     cmdline.push_str(kitsune::INITRD_CMDLINE_EXTRA);
+                }
+                if block.is_some() {
+                    if !cmdline.contains("virtio_mmio.device=") {
+                        cmdline.push(' ');
+                        cmdline.push_str(&format!(
+                            "virtio_mmio.device=4K@{:#x}:{}",
+                            kitsune::VirtioBlock::MMIO_BASE,
+                            kitsune::VirtioBlock::IRQ,
+                        ));
+                    }
+                    if !cmdline.split_whitespace().any(|t| t.starts_with("root=")) {
+                        cmdline.push_str(" root=/dev/vda rw");
+                    }
                 }
                 let boot = kitsune::KernelBootConfig {
                     kernel: &kernel,

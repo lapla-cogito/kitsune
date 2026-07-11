@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+acpi_tables = "0.2.1"
 clap = { version = "4.6.1", features = ["derive"] }
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25.0"
 libc = "0.2"
 linux-loader = { version = "0.14.0", features = ["bzimage"] }
 thiserror = "2.0.18"
+virtio-queue = "0.18.0"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 vm-superio = "0.8.1"
+vmm-sys-util = "0.15.0"

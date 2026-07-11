@@ -40,6 +40,9 @@ pub enum Error {
     #[error("serial device error: {0}")]
     Serial(String),
 
+    #[error("block device error: {0}")]
+    Block(String),
+
     #[error("unexpected vCPU exit: {0}")]
     UnexpectedExit(String),
 }
