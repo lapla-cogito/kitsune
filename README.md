@@ -2,6 +2,8 @@
 
 A KVM-based VMM written in Rust. Kitsune means "Fox" in Japanese.
 
+![kitsune image](./img/kitsune.jpg)
+
 ## Features
 
 - Direct boot of Linux `vmlinux` (ELF) or `bzImage`
