@@ -97,6 +97,8 @@ impl Vmm {
     /// Run the guest until it halts or shuts down.
     pub fn run(&mut self) -> crate::error::Result<()> {
         loop {
+            self.serial.poll_stdin()?;
+
             let exit = match self.vcpu.run() {
                 Ok(exit) => exit,
                 Err(e) if e.errno() == libc::EINTR => continue,

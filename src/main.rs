@@ -76,6 +76,12 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             let mut vmm = kitsune::Vmm::new(&config)?;
 
             if let Some(kernel) = kernel {
+                let mut cmdline = cmdline;
+                if initrd.is_some() && !cmdline.split_whitespace().any(|t| t.starts_with("rdinit="))
+                {
+                    cmdline.push(' ');
+                    cmdline.push_str(kitsune::INITRD_CMDLINE_EXTRA);
+                }
                 let boot = kitsune::KernelBootConfig {
                     kernel: &kernel,
                     initrd: initrd.as_deref(),
