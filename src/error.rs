@@ -52,6 +52,9 @@ pub enum Error {
     #[error("block device error: {0}")]
     Block(String),
 
+    #[error("network device error: {0}")]
+    Net(String),
+
     #[error("unexpected vCPU exit: {0}")]
     UnexpectedExit(String),
 }

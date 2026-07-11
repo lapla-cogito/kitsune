@@ -1,4 +1,3 @@
-
 use vm_memory::GuestMemoryBackend as _;
 use vm_memory::bytes::Bytes as _;
 
@@ -13,6 +12,7 @@ pub struct Vmm {
     vcpus: Vec<kvm_ioctls::VcpuFd>,
     serial: Option<crate::devices::SerialConsole>,
     block: Option<crate::devices::VirtioBlock>,
+    net: Option<crate::devices::VirtioNet>,
     num_vcpus: u8,
     /// When true, `VcpuExit::Hlt` ends `run()`.
     exit_on_hlt: bool,
@@ -72,6 +72,7 @@ impl Vmm {
             vcpus,
             serial: Some(serial),
             block: None,
+            net: None,
             num_vcpus: config.num_vcpus,
             exit_on_hlt: true,
         })
@@ -85,6 +86,17 @@ impl Vmm {
             ));
         }
         self.block = Some(crate::devices::VirtioBlock::new(path, &self.vm)?);
+        Ok(())
+    }
+
+    /// Attach a virtio-net device backed by the given host TAP interface.
+    pub fn add_net_device(&mut self, tap_ifname: &str) -> crate::error::Result<()> {
+        if self.net.is_some() {
+            return Err(crate::error::Error::Net(
+                "only one network device is supported".into(),
+            ));
+        }
+        self.net = Some(crate::devices::VirtioNet::new(tap_ifname, &self.vm)?);
         Ok(())
     }
 
@@ -122,13 +134,24 @@ impl Vmm {
         &mut self,
         config: &crate::boot::KernelBootConfig<'_>,
     ) -> crate::error::Result<()> {
-        let virtio = self.block.as_ref().map(|_| crate::acpi::VirtioMmioAcpi {
-            base: crate::devices::VirtioBlock::MMIO_BASE as u32,
-            size: 0x1000,
-            irq: crate::devices::VirtioBlock::IRQ,
-            uid: 0,
-        });
-        crate::acpi::install_tables(&self.guest_mem, virtio.as_slice(), self.num_vcpus)?;
+        let mut virtio = Vec::new();
+        if self.block.is_some() {
+            virtio.push(crate::acpi::VirtioMmioAcpi {
+                base: crate::devices::VirtioBlock::MMIO_BASE as u32,
+                size: 0x1000,
+                irq: crate::devices::VirtioBlock::IRQ,
+                uid: 0,
+            });
+        }
+        if self.net.is_some() {
+            virtio.push(crate::acpi::VirtioMmioAcpi {
+                base: crate::devices::VirtioNet::MMIO_BASE as u32,
+                size: 0x1000,
+                irq: crate::devices::VirtioNet::IRQ,
+                uid: 1,
+            });
+        }
+        crate::acpi::install_tables(&self.guest_mem, &virtio, self.num_vcpus)?;
 
         let entry = crate::boot::load_linux(&self.guest_mem, config)?;
 
@@ -161,6 +184,7 @@ impl Vmm {
                 .expect("serial console is installed at construction"),
         ));
         let block = std::sync::Arc::new(std::sync::Mutex::new(self.block.take()));
+        let net = std::sync::Arc::new(std::sync::Mutex::new(self.net.take()));
         let mem = self.guest_mem.clone();
         let exit_on_hlt = self.exit_on_hlt;
 
@@ -177,6 +201,7 @@ impl Vmm {
                 stop: std::sync::Arc::clone(&stop),
                 serial: std::sync::Arc::clone(&serial),
                 block: std::sync::Arc::clone(&block),
+                net: std::sync::Arc::clone(&net),
                 mem: mem.clone(),
             };
             handles.push(
@@ -196,6 +221,7 @@ impl Vmm {
                 stop: std::sync::Arc::clone(&stop),
                 serial: std::sync::Arc::clone(&serial),
                 block: std::sync::Arc::clone(&block),
+                net: std::sync::Arc::clone(&net),
                 mem,
             },
         );
@@ -227,6 +253,9 @@ impl Vmm {
         if let Ok(b) = std::sync::Arc::try_unwrap(block) {
             self.block = b.into_inner().unwrap_or_else(|e| e.into_inner());
         }
+        if let Ok(n) = std::sync::Arc::try_unwrap(net) {
+            self.net = n.into_inner().unwrap_or_else(|e| e.into_inner());
+        }
 
         match first_err {
             Some(e) => Err(e),
@@ -242,6 +271,7 @@ struct VcpuRunCtx {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
     block: std::sync::Arc<std::sync::Mutex<Option<crate::devices::VirtioBlock>>>,
+    net: std::sync::Arc<std::sync::Mutex<Option<crate::devices::VirtioNet>>>,
     mem: vm_memory::GuestMemoryMmap<()>,
 }
 
@@ -252,6 +282,10 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .poll_stdin()?;
+            let mut net = ctx.net.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(net) = net.as_mut() {
+                net.poll_tap(&ctx.mem)?;
+            }
         }
 
         let exit = match vcpu.run() {
@@ -289,7 +323,16 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 }
             }
             kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
-                let guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
+                {
+                    let guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(dev) = guard.as_ref()
+                        && dev.handles(addr)
+                    {
+                        dev.read(addr, data);
+                        continue;
+                    }
+                }
+                let guard = ctx.net.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(dev) = guard.as_ref()
                     && dev.handles(addr)
                 {
@@ -297,7 +340,16 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 }
             }
             kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
-                let mut guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
+                {
+                    let mut guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(dev) = guard.as_mut()
+                        && dev.handles(addr)
+                    {
+                        dev.write(addr, data, &ctx.mem)?;
+                        continue;
+                    }
+                }
+                let mut guard = ctx.net.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(dev) = guard.as_mut()
                     && dev.handles(addr)
                 {

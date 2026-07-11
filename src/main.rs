@@ -21,6 +21,10 @@ enum Command {
         #[arg(long, requires = "kernel")]
         block: Option<std::path::PathBuf>,
 
+        /// Host TAP interface name for virtio-net (e.g. tap0)
+        #[arg(long, requires = "kernel")]
+        tap: Option<String>,
+
         /// Kernel command line
         #[arg(long, default_value = kitsune::DEFAULT_KERNEL_CMDLINE)]
         cmdline: String,
@@ -65,6 +69,7 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             kernel,
             initrd,
             block,
+            tap,
             cmdline,
             flat_binary,
             memory,
@@ -97,6 +102,9 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             if let Some(block) = block.as_ref() {
                 vmm.add_block_device(block)?;
             }
+            if let Some(tap) = tap.as_ref() {
+                vmm.add_net_device(tap)?;
+            }
 
             if let Some(kernel) = kernel {
                 let mut cmdline = cmdline;
@@ -105,18 +113,35 @@ fn run(cli: Cli) -> kitsune::Result<()> {
                     cmdline.push(' ');
                     cmdline.push_str(kitsune::INITRD_CMDLINE_EXTRA);
                 }
-                if block.is_some() {
-                    if !cmdline.contains("virtio_mmio.device=") {
-                        cmdline.push(' ');
-                        cmdline.push_str(&format!(
-                            "virtio_mmio.device=4K@{:#x}:{}",
-                            kitsune::VirtioBlock::MMIO_BASE,
-                            kitsune::VirtioBlock::IRQ,
-                        ));
-                    }
-                    if !cmdline.split_whitespace().any(|t| t.starts_with("root=")) {
-                        cmdline.push_str(" root=/dev/vda rw");
-                    }
+                // Optional cmdline discovery for older kernels; ACPI is primary.
+                if block.is_some()
+                    && !cmdline.contains(&format!(
+                        "virtio_mmio.device=4K@{:#x}:",
+                        kitsune::VirtioBlock::MMIO_BASE
+                    ))
+                {
+                    cmdline.push(' ');
+                    cmdline.push_str(&format!(
+                        "virtio_mmio.device=4K@{:#x}:{}",
+                        kitsune::VirtioBlock::MMIO_BASE,
+                        kitsune::VirtioBlock::IRQ,
+                    ));
+                }
+                if tap.is_some()
+                    && !cmdline.contains(&format!(
+                        "virtio_mmio.device=4K@{:#x}:",
+                        kitsune::VirtioNet::MMIO_BASE
+                    ))
+                {
+                    cmdline.push(' ');
+                    cmdline.push_str(&format!(
+                        "virtio_mmio.device=4K@{:#x}:{}",
+                        kitsune::VirtioNet::MMIO_BASE,
+                        kitsune::VirtioNet::IRQ,
+                    ));
+                }
+                if block.is_some() && !cmdline.split_whitespace().any(|t| t.starts_with("root=")) {
+                    cmdline.push_str(" root=/dev/vda rw");
                 }
                 let boot = kitsune::KernelBootConfig {
                     kernel: &kernel,
