@@ -1,27 +1,34 @@
+
 use vm_memory::GuestMemoryBackend as _;
 use vm_memory::bytes::Bytes as _;
 
 /// Virtual machine monitor instance.
 ///
-/// Field order is intentional: `guest_mem` must outlive `vm`/`vcpu` so KVM
+/// Field order is intentional: `guest_mem` must outlive `vm`/`vcpus` so KVM
 /// memslots are not left pointing at unmapped host pages on drop.
 pub struct Vmm {
     _kvm: kvm_ioctls::Kvm,
     guest_mem: vm_memory::GuestMemoryMmap<()>,
     vm: kvm_ioctls::VmFd,
-    vcpu: kvm_ioctls::VcpuFd,
-    serial: crate::devices::SerialConsole,
+    vcpus: Vec<kvm_ioctls::VcpuFd>,
+    serial: Option<crate::devices::SerialConsole>,
     block: Option<crate::devices::VirtioBlock>,
+    num_vcpus: u8,
     /// When true, `VcpuExit::Hlt` ends `run()`.
-    /// Linux boots keep running so idle guests can still receive serial input.
     exit_on_hlt: bool,
 }
 
 impl Vmm {
-    /// Create a VM with guest memory, IRQ chip, PIT, and a single vCPU.
+    /// Create a VM with guest memory, IRQ chip, PIT, and `config.num_vcpus` vCPUs.
     pub fn new(config: &crate::config::VmmConfig) -> crate::error::Result<Self> {
         if config.mem_size == 0 || !config.mem_size.is_multiple_of(4096) {
             return Err(crate::error::Error::InvalidMemorySize(config.mem_size));
+        }
+        if config.num_vcpus == 0 || config.num_vcpus > crate::config::MAX_VCPUS {
+            return Err(crate::error::Error::InvalidVcpuCount(
+                config.num_vcpus,
+                crate::config::MAX_VCPUS,
+            ));
         }
 
         let kvm = kvm_ioctls::Kvm::new().map_err(crate::error::Error::KvmOpen)?;
@@ -46,13 +53,15 @@ impl Vmm {
             .map_err(crate::error::Error::KvmIoctl)?;
 
         let guest_mem = crate::memory::create_guest_memory(&vm, config.mem_size)?;
-        let vcpu = vm.create_vcpu(0).map_err(crate::error::Error::KvmIoctl)?;
 
-        let cpuid = kvm
-            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-            .map_err(crate::error::Error::KvmIoctl)?;
-        vcpu.set_cpuid2(&cpuid)
-            .map_err(crate::error::Error::KvmIoctl)?;
+        let mut vcpus = Vec::with_capacity(usize::from(config.num_vcpus));
+        for id in 0..config.num_vcpus {
+            let vcpu = vm
+                .create_vcpu(u64::from(id))
+                .map_err(crate::error::Error::KvmIoctl)?;
+            crate::vcpu::setup_cpuid(&kvm, &vcpu, id, config.num_vcpus)?;
+            vcpus.push(vcpu);
+        }
 
         let serial = crate::devices::SerialConsole::new(&vm)?;
 
@@ -60,9 +69,10 @@ impl Vmm {
             _kvm: kvm,
             guest_mem,
             vm,
-            vcpu,
-            serial,
+            vcpus,
+            serial: Some(serial),
             block: None,
+            num_vcpus: config.num_vcpus,
             exit_on_hlt: true,
         })
     }
@@ -85,6 +95,9 @@ impl Vmm {
         load_addr: u64,
         entry: u64,
     ) -> crate::error::Result<()> {
+        if self.num_vcpus != 1 {
+            return Err(crate::error::Error::FlatBinaryMultiVcpu);
+        }
         if !self
             .guest_mem
             .check_range(vm_memory::GuestAddress(load_addr), image.len())
@@ -99,7 +112,7 @@ impl Vmm {
             .write_slice(image, vm_memory::GuestAddress(load_addr))
             .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
 
-        crate::vcpu::setup_real_mode(&self.vcpu, entry)?;
+        crate::vcpu::setup_real_mode(&self.vcpus[0], entry)?;
         self.exit_on_hlt = true;
         Ok(())
     }
@@ -109,89 +122,222 @@ impl Vmm {
         &mut self,
         config: &crate::boot::KernelBootConfig<'_>,
     ) -> crate::error::Result<()> {
-        // Always install ACPI (MADT/IOAPIC + COM1). Virtio-mmio is optional.
         let virtio = self.block.as_ref().map(|_| crate::acpi::VirtioMmioAcpi {
             base: crate::devices::VirtioBlock::MMIO_BASE as u32,
             size: 0x1000,
             irq: crate::devices::VirtioBlock::IRQ,
             uid: 0,
         });
-        crate::acpi::install_tables(&self.guest_mem, virtio.as_slice())?;
+        crate::acpi::install_tables(&self.guest_mem, virtio.as_slice(), self.num_vcpus)?;
 
         let entry = crate::boot::load_linux(&self.guest_mem, config)?;
-        crate::vcpu::setup_long_mode(&self.vcpu, &self.guest_mem, entry)?;
+
+        // BSP runs the kernel entry in long mode.
+        crate::vcpu::setup_long_mode(&self.vcpus[0], &self.guest_mem, entry)?;
+
+        // APs wait for INIT/SIPI from the BSP (handled by the in-kernel irqchip).
+        for ap in self.vcpus.iter().skip(1) {
+            let mp = kvm_bindings::kvm_mp_state {
+                mp_state: kvm_bindings::KVM_MP_STATE_UNINITIALIZED,
+            };
+            ap.set_mp_state(mp).map_err(crate::error::Error::KvmIoctl)?;
+        }
+
         self.exit_on_hlt = false;
         Ok(())
     }
 
-    /// Run the guest until it shuts down.
+    /// Run all vCPUs until the guest shuts down.
+    ///
+    /// The BSP runs on this thread (so the SIGALRM kick reaches its `KVM_RUN`).
+    /// Application processors run on background threads.
     pub fn run(&mut self) -> crate::error::Result<()> {
-        // Periodic SIGALRM interrupts KVM_RUN (EINTR) so we can poll host stdin
-        // while the guest is blocked waiting for serial input. Without this,
-        // in-kernel halt never returns to userspace and typed input is stuck.
         let _kick = KvmRunKickTimer::arm(20)?;
 
-        loop {
-            self.serial.poll_stdin()?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serial = std::sync::Arc::new(std::sync::Mutex::new(
+            self.serial
+                .take()
+                .expect("serial console is installed at construction"),
+        ));
+        let block = std::sync::Arc::new(std::sync::Mutex::new(self.block.take()));
+        let mem = self.guest_mem.clone();
+        let exit_on_hlt = self.exit_on_hlt;
 
-            let exit = match self.vcpu.run() {
-                Ok(exit) => exit,
-                Err(e) if e.errno() == libc::EINTR => continue,
-                Err(e) => return Err(crate::error::Error::KvmIoctl(e)),
+        let mut vcpus = std::mem::take(&mut self.vcpus);
+        let bsp = vcpus.remove(0);
+
+        let mut handles = Vec::with_capacity(vcpus.len());
+        for (i, vcpu) in vcpus.into_iter().enumerate() {
+            let id = (i + 1) as u8;
+            let ctx = VcpuRunCtx {
+                id,
+                is_bsp: false,
+                exit_on_hlt: false,
+                stop: std::sync::Arc::clone(&stop),
+                serial: std::sync::Arc::clone(&serial),
+                block: std::sync::Arc::clone(&block),
+                mem: mem.clone(),
             };
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("vcpu-{id}"))
+                    .spawn(move || run_vcpu_loop(vcpu, ctx))
+                    .map_err(|e| crate::error::Error::VcpuThread(e.to_string()))?,
+            );
+        }
 
-            match exit {
-                kvm_ioctls::VcpuExit::IoOut(port, data) => {
-                    if crate::devices::SerialConsole::handles_port(port) {
-                        self.serial.bus_write(port, data)?;
+        let bsp_result = run_vcpu_loop(
+            bsp,
+            VcpuRunCtx {
+                id: 0,
+                is_bsp: true,
+                exit_on_hlt,
+                stop: std::sync::Arc::clone(&stop),
+                serial: std::sync::Arc::clone(&serial),
+                block: std::sync::Arc::clone(&block),
+                mem,
+            },
+        );
+        // Ensure AP threads leave their KVM_RUN loops.
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut first_err = bsp_result.err();
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
                     }
                 }
-                kvm_ioctls::VcpuExit::IoIn(port, data) => {
-                    if crate::devices::SerialConsole::handles_port(port) {
-                        self.serial.bus_read(port, data);
-                    } else {
-                        data.fill(0xff);
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(crate::error::Error::VcpuThread(
+                            "vCPU thread panicked".into(),
+                        ));
                     }
-                }
-                kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
-                    if let Some(block) = self.block.as_ref()
-                        && block.handles(addr)
-                    {
-                        block.read(addr, data);
-                    }
-                }
-                kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
-                    if let Some(block) = self.block.as_mut()
-                        && block.handles(addr)
-                    {
-                        let mem = &self.guest_mem;
-                        block.write(addr, data, mem)?;
-                    }
-                }
-                kvm_ioctls::VcpuExit::Hlt => {
-                    if self.exit_on_hlt {
-                        break;
-                    }
-                    // Linux idle: avoid a tight spin when HLT exits to userspace.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                kvm_ioctls::VcpuExit::Shutdown => break,
-                kvm_ioctls::VcpuExit::SystemEvent(event_type, _) => match event_type {
-                    kvm_bindings::KVM_SYSTEM_EVENT_SHUTDOWN
-                    | kvm_bindings::KVM_SYSTEM_EVENT_RESET => break,
-                    other => {
-                        return Err(crate::error::Error::UnexpectedExit(format!(
-                            "system event {other}"
-                        )));
-                    }
-                },
-                other => {
-                    return Err(crate::error::Error::UnexpectedExit(format!("{other:?}")));
                 }
             }
         }
-        Ok(())
+
+        if let Ok(s) = std::sync::Arc::try_unwrap(serial) {
+            self.serial = Some(s.into_inner().unwrap_or_else(|e| e.into_inner()));
+        }
+        if let Ok(b) = std::sync::Arc::try_unwrap(block) {
+            self.block = b.into_inner().unwrap_or_else(|e| e.into_inner());
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
+}
+
+struct VcpuRunCtx {
+    id: u8,
+    is_bsp: bool,
+    exit_on_hlt: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
+    block: std::sync::Arc<std::sync::Mutex<Option<crate::devices::VirtioBlock>>>,
+    mem: vm_memory::GuestMemoryMmap<()>,
+}
+
+fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error::Result<()> {
+    while !ctx.stop.load(std::sync::atomic::Ordering::Relaxed) {
+        if ctx.is_bsp {
+            ctx.serial
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poll_stdin()?;
+        }
+
+        let exit = match vcpu.run() {
+            Ok(exit) => exit,
+            // EINTR: kick timer. EAGAIN: AP not yet runnable (Wait-For-SIPI).
+            Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
+                if e.errno() == libc::EAGAIN {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                continue;
+            }
+            Err(e) => {
+                ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::error::Error::KvmIoctl(e));
+            }
+        };
+
+        match exit {
+            kvm_ioctls::VcpuExit::IoOut(port, data) => {
+                if crate::devices::SerialConsole::handles_port(port) {
+                    ctx.serial
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .bus_write(port, data)?;
+                }
+            }
+            kvm_ioctls::VcpuExit::IoIn(port, data) => {
+                if crate::devices::SerialConsole::handles_port(port) {
+                    ctx.serial
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .bus_read(port, data);
+                } else {
+                    data.fill(0xff);
+                }
+            }
+            kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
+                let guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(dev) = guard.as_ref()
+                    && dev.handles(addr)
+                {
+                    dev.read(addr, data);
+                }
+            }
+            kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
+                let mut guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(dev) = guard.as_mut()
+                    && dev.handles(addr)
+                {
+                    dev.write(addr, data, &ctx.mem)?;
+                }
+            }
+            kvm_ioctls::VcpuExit::Hlt => {
+                if ctx.exit_on_hlt {
+                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            kvm_ioctls::VcpuExit::Shutdown => {
+                ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            kvm_ioctls::VcpuExit::SystemEvent(event_type, _) => match event_type {
+                kvm_bindings::KVM_SYSTEM_EVENT_SHUTDOWN | kvm_bindings::KVM_SYSTEM_EVENT_RESET => {
+                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                other => {
+                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(crate::error::Error::UnexpectedExit(format!(
+                        "vcpu{} system event {other}",
+                        ctx.id
+                    )));
+                }
+            },
+            other => {
+                ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::error::Error::UnexpectedExit(format!(
+                    "vcpu{} {other:?}",
+                    ctx.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Arms ITIMER_REAL so blocking `KVM_RUN` returns `EINTR` periodically.

@@ -34,11 +34,19 @@ pub struct VirtioMmioAcpi {
 
 /// Build RSDP + XSDT + FADT + MADT + DSDT and write them into guest memory.
 ///
+/// `num_vcpus` Local APICs are advertised in the MADT (APIC IDs `0..num_vcpus`).
 /// Returns the guest-physical address of the RSDP (for `acpi_rsdp=`).
 pub fn install_tables(
     mem: &vm_memory::GuestMemoryMmap<()>,
     virtio_devices: &[VirtioMmioAcpi],
+    num_vcpus: u8,
 ) -> crate::error::Result<u64> {
+    if num_vcpus == 0 {
+        return Err(crate::error::Error::InvalidVcpuCount(
+            0,
+            crate::config::MAX_VCPUS,
+        ));
+    }
     // Tables occupy the 128 KiB BIOS hole (0xe0000..0x100000), which is
     // backed by our single KVM memslot starting at GPA 0.
     if mem.last_addr().0 < 0x10_0000 {
@@ -84,11 +92,13 @@ pub fn install_tables(
         OEM_REVISION,
         acpi_tables::madt::LocalInterruptController::Address(LAPIC_ADDR),
     );
-    madt.add_structure(acpi_tables::madt::ProcessorLocalApic::new(
-        0,
-        0,
-        acpi_tables::madt::EnabledStatus::Enabled,
-    ));
+    for apic_id in 0..num_vcpus {
+        madt.add_structure(acpi_tables::madt::ProcessorLocalApic::new(
+            apic_id,
+            apic_id,
+            acpi_tables::madt::EnabledStatus::Enabled,
+        ));
+    }
     madt.add_structure(acpi_tables::madt::IoApic::new(0, IOAPIC_ADDR, 0));
     let mut madt_bytes = Vec::new();
     madt.to_aml_bytes(&mut madt_bytes);

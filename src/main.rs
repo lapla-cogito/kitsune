@@ -33,6 +33,14 @@ enum Command {
         #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
         memory: u32,
 
+        /// Number of guest vCPUs
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::value_parser!(u8).range(1..=kitsune::MAX_VCPUS as i64)
+        )]
+        cpus: u8,
+
         /// Guest-physical load address (flat binary only)
         #[arg(long, default_value_t = 0)]
         load_addr: u64,
@@ -60,6 +68,7 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             cmdline,
             flat_binary,
             memory,
+            cpus,
             load_addr,
             entry,
         } => {
@@ -72,11 +81,16 @@ fn run(cli: Cli) -> kitsune::Result<()> {
                     eprintln!("error: kernel boot requires at least 32 MiB of memory");
                     std::process::exit(2);
                 }
+                (None, Some(_)) if cpus != 1 => {
+                    eprintln!("error: --flat-binary supports only --cpus 1");
+                    std::process::exit(2);
+                }
                 _ => {}
             }
 
             let config = kitsune::VmmConfig {
                 mem_size: (memory as usize) * 1024 * 1024,
+                num_vcpus: cpus,
             };
             let mut vmm = kitsune::Vmm::new(&config)?;
 

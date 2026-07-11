@@ -28,6 +28,42 @@ const MSR_IA32_TSC: u32 = 0x0000_0010;
 const MSR_IA32_MISC_ENABLE: u32 = 0x0000_01a0;
 const MSR_IA32_MISC_ENABLE_FAST_STRING: u64 = 1;
 
+/// Install host-supported CPUID with per-vCPU APIC ID and logical CPU count.
+pub fn setup_cpuid(
+    kvm: &kvm_ioctls::Kvm,
+    vcpu: &kvm_ioctls::VcpuFd,
+    vcpu_id: u8,
+    num_vcpus: u8,
+) -> crate::error::Result<()> {
+    let mut cpuid = kvm
+        .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .map_err(crate::error::Error::KvmIoctl)?;
+
+    for entry in cpuid.as_mut_slice() {
+        match entry.function {
+            1 => {
+                // EBX[31:24] = initial APIC ID; EBX[23:16] = logical processors.
+                entry.ebx = (entry.ebx & 0x0000_ffff)
+                    | (u32::from(num_vcpus) << 16)
+                    | (u32::from(vcpu_id) << 24);
+                if num_vcpus > 1 {
+                    // EDX bit 28: HTT (multi-threaded / multi-core topology present).
+                    entry.edx |= 1 << 28;
+                }
+            }
+            0xb if entry.index == 0 => {
+                // Extended topology: x2APIC ID in EDX.
+                entry.edx = u32::from(vcpu_id);
+            }
+            _ => {}
+        }
+    }
+
+    vcpu.set_cpuid2(&cpuid)
+        .map_err(crate::error::Error::KvmIoctl)?;
+    Ok(())
+}
+
 /// Configure a vCPU for 16-bit real mode with CS base 0 and the given entry RIP.
 pub fn setup_real_mode(vcpu: &kvm_ioctls::VcpuFd, entry: u64) -> crate::error::Result<()> {
     let mut sregs = vcpu.get_sregs().map_err(crate::error::Error::KvmIoctl)?;

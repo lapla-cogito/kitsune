@@ -13,6 +13,15 @@ pub enum Error {
     #[error("invalid guest memory size {0} (must be a non-zero multiple of 4096)")]
     InvalidMemorySize(usize),
 
+    #[error("invalid vCPU count {0} (must be 1..={1})")]
+    InvalidVcpuCount(u8, u8),
+
+    #[error("flat binary boot supports only one vCPU")]
+    FlatBinaryMultiVcpu,
+
+    #[error("vCPU thread failed: {0}")]
+    VcpuThread(String),
+
     #[error("failed to allocate guest memory: {0}")]
     GuestMemory(String),
 
