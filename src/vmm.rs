@@ -14,7 +14,7 @@ pub struct Vmm {
 }
 
 impl Vmm {
-    /// Create a VM with guest memory and a single vCPU.
+    /// Create a VM with guest memory, IRQ chip, PIT, and a single vCPU.
     pub fn new(config: &crate::config::VmmConfig) -> crate::error::Result<Self> {
         if config.mem_size == 0 || !config.mem_size.is_multiple_of(4096) {
             return Err(crate::error::Error::InvalidMemorySize(config.mem_size));
@@ -30,8 +30,25 @@ impl Vmm {
         }
 
         let vm = kvm.create_vm().map_err(crate::error::Error::KvmIoctl)?;
+        vm.set_tss_address(crate::boot::KVM_TSS_ADDRESS)
+            .map_err(crate::error::Error::KvmIoctl)?;
+        vm.create_irq_chip()
+            .map_err(crate::error::Error::KvmIoctl)?;
+        let pit_config = kvm_bindings::kvm_pit_config {
+            flags: kvm_bindings::KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        };
+        vm.create_pit2(pit_config)
+            .map_err(crate::error::Error::KvmIoctl)?;
+
         let guest_mem = crate::memory::create_guest_memory(&vm, config.mem_size)?;
         let vcpu = vm.create_vcpu(0).map_err(crate::error::Error::KvmIoctl)?;
+
+        let cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(crate::error::Error::KvmIoctl)?;
+        vcpu.set_cpuid2(&cpuid)
+            .map_err(crate::error::Error::KvmIoctl)?;
 
         Ok(Self {
             _kvm: kvm,
@@ -67,12 +84,21 @@ impl Vmm {
         Ok(())
     }
 
+    /// Load a Linux kernel (ELF or bzImage), optional initrd, and cmdline.
+    pub fn load_kernel(
+        &mut self,
+        config: &crate::boot::KernelBootConfig<'_>,
+    ) -> crate::error::Result<()> {
+        let entry = crate::boot::load_linux(&self.guest_mem, config)?;
+        crate::vcpu::setup_long_mode(&self.vcpu, &self.guest_mem, entry)?;
+        Ok(())
+    }
+
     /// Run the guest until it halts or shuts down.
     pub fn run(&mut self) -> crate::error::Result<()> {
         loop {
             let exit = match self.vcpu.run() {
                 Ok(exit) => exit,
-                // KVM_RUN returns EINTR when interrupted by a signal.
                 Err(e) if e.errno() == libc::EINTR => continue,
                 Err(e) => return Err(crate::error::Error::KvmIoctl(e)),
             };
@@ -91,6 +117,15 @@ impl Vmm {
                     }
                 }
                 kvm_ioctls::VcpuExit::Hlt | kvm_ioctls::VcpuExit::Shutdown => break,
+                kvm_ioctls::VcpuExit::SystemEvent(event_type, _) => match event_type {
+                    kvm_bindings::KVM_SYSTEM_EVENT_SHUTDOWN
+                    | kvm_bindings::KVM_SYSTEM_EVENT_RESET => break,
+                    other => {
+                        return Err(crate::error::Error::UnexpectedExit(format!(
+                            "system event {other}"
+                        )));
+                    }
+                },
                 other => {
                     return Err(crate::error::Error::UnexpectedExit(format!("{other:?}")));
                 }

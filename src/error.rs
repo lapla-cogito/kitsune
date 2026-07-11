@@ -25,6 +25,18 @@ pub enum Error {
     #[error("guest image of {len} bytes does not fit at load address {load_addr:#x}")]
     ImageDoesNotFit { load_addr: u64, len: usize },
 
+    #[error("failed to load kernel: {0}")]
+    KernelLoad(String),
+
+    #[error("failed to configure boot parameters: {0}")]
+    BootConfigure(String),
+
+    #[error("invalid kernel command line: {0}")]
+    Cmdline(String),
+
+    #[error("failed to set model-specific registers")]
+    MsrSetup,
+
     #[error("serial device error: {0}")]
     Serial(String),
 

@@ -12,3 +12,6 @@ impl Default for VmmConfig {
         }
     }
 }
+
+/// Default kernel command line for serial console boot without PCI.
+pub const DEFAULT_KERNEL_CMDLINE: &str = "console=ttyS0 reboot=k panic=1 pci=off nomodule";
