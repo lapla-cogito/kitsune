@@ -69,7 +69,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: target/ci-guest
-          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v4-net-offload
+          # Invalidates when prepare script, guest /init, or related inputs change.
+          key: ${{ runner.os }}-ci-guest-${{ hashFiles('scripts/ci_prepare_guest.sh', 'scripts/guest_init.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-ci-guest-
       - name: Prepare guest images
         run: bash scripts/ci_prepare_guest.sh target/ci-guest
       - name: Unit and integration tests
