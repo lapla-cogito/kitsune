@@ -69,7 +69,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: target/ci-guest
-          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v2-net
+          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v3-smp
       - name: Prepare guest images
         run: bash scripts/ci_prepare_guest.sh target/ci-guest
       - name: Unit and integration tests

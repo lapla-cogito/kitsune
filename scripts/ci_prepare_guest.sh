@@ -7,7 +7,7 @@ mkdir -p "$OUT"
 
 VMLINUX_URL="${KITSUNE_VMLINUX_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260708-e8a198e23f48-0/x86_64/vmlinux-6.18.36}"
 # Bump when init contents change so CI/local caches rebuild.
-INITRD_STAMP="v2-net"
+INITRD_STAMP="v3-smp"
 
 if [[ ! -f "$OUT/vmlinux" ]]; then
   echo "downloading vmlinux..."
@@ -29,6 +29,12 @@ mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
 echo "kitsune-initrd-ok"
+# Online CPU count (SMP / MADT bring-up).
+cpus=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)
+echo "kitsune-cpus=$cpus"
+if [ "$cpus" -ge 2 ]; then
+  echo "kitsune-smp-ok"
+fi
 if [ -e /dev/vda ]; then
   echo "kitsune-blk-ok"
 fi
