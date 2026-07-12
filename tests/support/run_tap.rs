@@ -5,8 +5,14 @@ mod pipe;
 
 pub use pipe::assert_contains;
 
+static TAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run kitsune with TAP until timeout or all markers appear.
 pub fn run_until_with_tap(args: &[&str], timeout: std::time::Duration, markers: &[&str]) -> String {
+    let _guard = TAP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     if let Ok(tap) = std::env::var("KITSUNE_TAP_NAME") {
         return run_with_existing_tap(&tap, args, timeout, markers);
     }
