@@ -91,6 +91,11 @@ impl SerialConsole {
                 self.observe_guest_tx(byte)?;
             }
         }
+
+        if is_data && !data.is_empty() {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
         Ok(())
     }
 

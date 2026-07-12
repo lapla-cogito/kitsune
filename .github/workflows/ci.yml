@@ -1,0 +1,78 @@
+name: CI for kitsune
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust-toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Cache cargo
+        uses: ./.github/actions/cache_cargo
+      - name: Build
+        run: cargo build --release
+
+  fmt-and-lint:
+    needs: build-cache
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust-toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: ./.github/actions/cache_cargo
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test-suite:
+    needs: build-cache
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust-toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Cache cargo
+        uses: ./.github/actions/cache_cargo
+      - name: Install guest tools
+        run: sudo apt-get update && sudo apt-get -y install busybox-static e2fsprogs wget cpio
+      - name: Enable KVM access
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ls -l /dev/kvm
+          else
+            echo "/dev/kvm missing"
+            exit 1
+          fi
+      - name: Cache guest artifacts
+        uses: actions/cache@v6
+        with:
+          path: target/ci-guest
+          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v1
+      - name: Prepare guest images
+        run: bash scripts/ci_prepare_guest.sh target/ci-guest
+      - name: Unit and integration tests
+        env:
+          KITSUNE_REQUIRE_KVM: "1"
+          KITSUNE_GUEST_DIR: target/ci-guest
+        run: cargo test --release -- --nocapture
+      - name: Upload serial logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-guest-artifacts
+          path: target/ci-guest/
+          if-no-files-found: ignore
