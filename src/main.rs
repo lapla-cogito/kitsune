@@ -107,42 +107,14 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             }
 
             if let Some(kernel) = kernel {
-                let mut cmdline = cmdline;
-                if initrd.is_some() && !cmdline.split_whitespace().any(|t| t.starts_with("rdinit="))
-                {
-                    cmdline.push(' ');
-                    cmdline.push_str(kitsune::INITRD_CMDLINE_EXTRA);
-                }
-                // Optional cmdline discovery for older kernels; ACPI is primary.
-                if block.is_some()
-                    && !cmdline.contains(&format!(
-                        "virtio_mmio.device=4K@{:#x}:",
-                        kitsune::VirtioBlock::MMIO_BASE
-                    ))
-                {
-                    cmdline.push(' ');
-                    cmdline.push_str(&format!(
-                        "virtio_mmio.device=4K@{:#x}:{}",
-                        kitsune::VirtioBlock::MMIO_BASE,
-                        kitsune::VirtioBlock::IRQ,
-                    ));
-                }
-                if tap.is_some()
-                    && !cmdline.contains(&format!(
-                        "virtio_mmio.device=4K@{:#x}:",
-                        kitsune::VirtioNet::MMIO_BASE
-                    ))
-                {
-                    cmdline.push(' ');
-                    cmdline.push_str(&format!(
-                        "virtio_mmio.device=4K@{:#x}:{}",
-                        kitsune::VirtioNet::MMIO_BASE,
-                        kitsune::VirtioNet::IRQ,
-                    ));
-                }
-                if block.is_some() && !cmdline.split_whitespace().any(|t| t.starts_with("root=")) {
-                    cmdline.push_str(" root=/dev/vda rw");
-                }
+                let cmdline = kitsune::build_kernel_cmdline(
+                    &cmdline,
+                    kitsune::KernelCmdlineOpts {
+                        initrd: initrd.is_some(),
+                        block: block.is_some(),
+                        tap: tap.is_some(),
+                    },
+                );
                 let boot = kitsune::KernelBootConfig {
                     kernel: &kernel,
                     initrd: initrd.as_deref(),

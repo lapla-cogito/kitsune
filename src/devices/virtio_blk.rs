@@ -165,28 +165,14 @@ impl VirtioBlock {
     }
 
     fn device_features(&self) -> u64 {
-        let mut feats = VIRTIO_F_VERSION_1
-            | VIRTIO_BLK_F_SIZE_MAX
-            | VIRTIO_BLK_F_SEG_MAX
-            | VIRTIO_BLK_F_BLK_SIZE
-            | VIRTIO_BLK_F_FLUSH;
-        if self.readonly {
-            feats |= VIRTIO_BLK_F_RO;
-        }
-        feats
+        advertised_features(self.readonly)
     }
 
     fn config_byte(&self, idx: usize) -> u8 {
-        if idx >= CONFIG_LEN {
-            return 0;
-        }
-        let mut cfg = [0u8; CONFIG_LEN];
-        cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
-        cfg[8..12].copy_from_slice(&CONFIG_SIZE_MAX.to_le_bytes());
-        cfg[12..16].copy_from_slice(&CONFIG_SEG_MAX.to_le_bytes());
-        // geometry (offsets 16..20) left zero.
-        cfg[20..24].copy_from_slice(&CONFIG_BLK_SIZE.to_le_bytes());
-        cfg[idx]
+        config_space(self.capacity_sectors)
+            .get(idx)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn read(&self, addr: u64, data: &mut [u8]) {
@@ -497,6 +483,27 @@ enum BlockReqError {
     Unsupported,
 }
 
+fn advertised_features(readonly: bool) -> u64 {
+    let mut feats = VIRTIO_F_VERSION_1
+        | VIRTIO_BLK_F_SIZE_MAX
+        | VIRTIO_BLK_F_SEG_MAX
+        | VIRTIO_BLK_F_BLK_SIZE
+        | VIRTIO_BLK_F_FLUSH;
+    if readonly {
+        feats |= VIRTIO_BLK_F_RO;
+    }
+    feats
+}
+
+fn config_space(capacity_sectors: u64) -> [u8; CONFIG_LEN] {
+    let mut cfg = [0u8; CONFIG_LEN];
+    cfg[0..8].copy_from_slice(&capacity_sectors.to_le_bytes());
+    cfg[8..12].copy_from_slice(&CONFIG_SIZE_MAX.to_le_bytes());
+    cfg[12..16].copy_from_slice(&CONFIG_SEG_MAX.to_le_bytes());
+    cfg[20..24].copy_from_slice(&CONFIG_BLK_SIZE.to_le_bytes());
+    cfg
+}
+
 fn read_le(data: &[u8]) -> u32 {
     let mut buf = [0u8; 4];
     let n = data.len().min(4);
@@ -508,4 +515,28 @@ fn write_le(data: &mut [u8], value: u32) {
     let bytes = value.to_le_bytes();
     let n = data.len().min(4);
     data[..n].copy_from_slice(&bytes[..n]);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn features_include_flush_and_optional_ro() {
+        let rw = super::advertised_features(false);
+        assert_ne!(rw & super::VIRTIO_BLK_F_FLUSH, 0);
+        assert_ne!(rw & super::VIRTIO_F_VERSION_1, 0);
+        assert_eq!(rw & super::VIRTIO_BLK_F_RO, 0);
+
+        let ro = super::advertised_features(true);
+        assert_ne!(ro & super::VIRTIO_BLK_F_RO, 0);
+    }
+
+    #[test]
+    fn config_layout_capacity_and_blk_size() {
+        let sectors = 2048u64;
+        let cfg = super::config_space(sectors);
+        assert_eq!(&cfg[0..8], &sectors.to_le_bytes());
+        assert_eq!(&cfg[8..12], &super::CONFIG_SIZE_MAX.to_le_bytes());
+        assert_eq!(&cfg[12..16], &super::CONFIG_SEG_MAX.to_le_bytes());
+        assert_eq!(&cfg[20..24], &super::CONFIG_BLK_SIZE.to_le_bytes());
+    }
 }

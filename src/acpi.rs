@@ -180,3 +180,74 @@ fn write_bytes(
 fn align_up(value: u64, align: u64) -> u64 {
     (value + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::bytes::Bytes as _;
+
+    fn guest_mem(size: usize) -> vm_memory::GuestMemoryMmap<()> {
+        vm_memory::GuestMemoryMmap::<()>::from_ranges(&[(vm_memory::GuestAddress(0), size)])
+            .expect("guest memory")
+    }
+
+    #[test]
+    fn install_tables_writes_rsdp_signature() {
+        let mem = guest_mem(2 * 1024 * 1024);
+        let rsdp = super::install_tables(&mem, &[], 1).expect("acpi");
+        let mut sig = [0u8; 8];
+        mem.read_slice(&mut sig, vm_memory::GuestAddress(rsdp))
+            .expect("read rsdp");
+        assert_eq!(&sig, b"RSD PTR ");
+    }
+
+    #[test]
+    fn madt_grows_with_vcpus() {
+        let mem = guest_mem(2 * 1024 * 1024);
+        // One LAPIC vs many: more MADT structures → larger table blob after DSDT/FADT.
+        // Compare total occupied range by scanning for non-zero growth past ACPI base.
+        let _ = super::install_tables(&mem, &[], 1).expect("1 cpu");
+        let mut buf1 = vec![0u8; 4096];
+        mem.read_slice(&mut buf1, vm_memory::GuestAddress(super::ACPI_TABLES_BASE))
+            .expect("read");
+
+        let mem2 = guest_mem(2 * 1024 * 1024);
+        let _ = super::install_tables(&mem2, &[], 4).expect("4 cpu");
+        let mut buf4 = vec![0u8; 4096];
+        mem2.read_slice(&mut buf4, vm_memory::GuestAddress(super::ACPI_TABLES_BASE))
+            .expect("read");
+
+        assert_ne!(buf1, buf4);
+        // MADT Local APIC entry is 8 bytes each; 3 extra CPUs should enlarge the image.
+        let nz1 = buf1.iter().filter(|b| **b != 0).count();
+        let nz4 = buf4.iter().filter(|b| **b != 0).count();
+        assert!(nz4 > nz1);
+    }
+
+    #[test]
+    fn rejects_zero_vcpus() {
+        let mem = guest_mem(2 * 1024 * 1024);
+        assert!(super::install_tables(&mem, &[], 0).is_err());
+    }
+
+    #[test]
+    fn virtio_device_changes_dsdt() {
+        let mem = guest_mem(2 * 1024 * 1024);
+        let _ = super::install_tables(&mem, &[], 1).expect("no virtio");
+        let mut a = vec![0u8; 512];
+        mem.read_slice(&mut a, vm_memory::GuestAddress(super::ACPI_TABLES_BASE))
+            .unwrap();
+
+        let mem = guest_mem(2 * 1024 * 1024);
+        let devs = [super::VirtioMmioAcpi {
+            base: 0xd000_0000,
+            size: 0x1000,
+            irq: 5,
+            uid: 0,
+        }];
+        let _ = super::install_tables(&mem, &devs, 1).expect("virtio");
+        let mut b = vec![0u8; 512];
+        mem.read_slice(&mut b, vm_memory::GuestAddress(super::ACPI_TABLES_BASE))
+            .unwrap();
+        assert_ne!(a, b);
+    }
+}
