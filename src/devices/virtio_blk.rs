@@ -15,10 +15,19 @@ const MMIO_VERSION: u32 = 2;
 const VIRTIO_ID_BLOCK: u32 = 2;
 const VENDOR_ID: u32 = 0x10_00; // QEMU-compatible
 
-// Feature bits
+// Feature bits (virtio_blk + transport)
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
+const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
+const VIRTIO_BLK_F_RO: u64 = 1 << 5;
+const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-const DEVICE_FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH;
+
+// Config field values when the matching feature is offered.
+const CONFIG_SIZE_MAX: u32 = 65536;
+/// Max data descriptors per request (header + status are extra).
+const CONFIG_SEG_MAX: u32 = 32;
+const CONFIG_BLK_SIZE: u32 = 512;
 
 // Status bits
 const STATUS_FEATURES_OK: u8 = 8;
@@ -65,6 +74,9 @@ const REG_QUEUE_USED_HIGH: u64 = 0xa4;
 const REG_CONFIG_GENERATION: u64 = 0xfc;
 const REG_CONFIG: u64 = 0x100;
 
+/// Bytes of `struct virtio_blk_config` we expose (through `blk_size`).
+const CONFIG_LEN: usize = 24;
+
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
 struct VirtioBlkReqHdr {
@@ -81,6 +93,7 @@ pub struct VirtioBlock {
     base: u64,
     file: std::fs::File,
     capacity_sectors: u64,
+    readonly: bool,
     queue: virtio_queue::Queue,
     status: u8,
     device_features_sel: u32,
@@ -99,11 +112,22 @@ impl VirtioBlock {
 
     /// Open `path` as a raw disk image and register IRQ `VIRTIO_BLK_IRQ` with KVM.
     pub fn new(path: &std::path::Path, vm: &kvm_ioctls::VmFd) -> crate::error::Result<Self> {
-        let file = std::fs::OpenOptions::new()
+        let (file, readonly) = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
-            .map_err(crate::error::Error::ImageIo)?;
+        {
+            Ok(f) => (f, false),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(path)
+                    .map_err(crate::error::Error::ImageIo)?;
+                (f, true)
+            }
+            Err(e) => return Err(crate::error::Error::ImageIo(e)),
+        };
+
         let len = file.metadata().map_err(crate::error::Error::ImageIo)?.len();
         if len < SECTOR_SIZE || !len.is_multiple_of(SECTOR_SIZE) {
             return Err(crate::error::Error::Block(
@@ -124,6 +148,7 @@ impl VirtioBlock {
             base: VIRTIO_MMIO_BASE,
             file,
             capacity_sectors,
+            readonly,
             queue,
             status: 0,
             device_features_sel: 0,
@@ -139,13 +164,37 @@ impl VirtioBlock {
         (self.base..self.base + VIRTIO_MMIO_SIZE).contains(&addr)
     }
 
+    fn device_features(&self) -> u64 {
+        let mut feats = VIRTIO_F_VERSION_1
+            | VIRTIO_BLK_F_SIZE_MAX
+            | VIRTIO_BLK_F_SEG_MAX
+            | VIRTIO_BLK_F_BLK_SIZE
+            | VIRTIO_BLK_F_FLUSH;
+        if self.readonly {
+            feats |= VIRTIO_BLK_F_RO;
+        }
+        feats
+    }
+
+    fn config_byte(&self, idx: usize) -> u8 {
+        if idx >= CONFIG_LEN {
+            return 0;
+        }
+        let mut cfg = [0u8; CONFIG_LEN];
+        cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
+        cfg[8..12].copy_from_slice(&CONFIG_SIZE_MAX.to_le_bytes());
+        cfg[12..16].copy_from_slice(&CONFIG_SEG_MAX.to_le_bytes());
+        // geometry (offsets 16..20) left zero.
+        cfg[20..24].copy_from_slice(&CONFIG_BLK_SIZE.to_le_bytes());
+        cfg[idx]
+    }
+
     pub fn read(&self, addr: u64, data: &mut [u8]) {
         let offset = addr - self.base;
-        if (REG_CONFIG..REG_CONFIG + 8).contains(&offset) {
-            let cap = self.capacity_sectors.to_le_bytes();
+        if (REG_CONFIG..REG_CONFIG + CONFIG_LEN as u64).contains(&offset) {
             for (i, byte) in data.iter_mut().enumerate() {
                 let idx = (offset - REG_CONFIG) as usize + i;
-                *byte = cap.get(idx).copied().unwrap_or(0);
+                *byte = self.config_byte(idx);
             }
             return;
         }
@@ -171,10 +220,11 @@ impl VirtioBlock {
             REG_DEVICE_ID => VIRTIO_ID_BLOCK,
             REG_VENDOR_ID => VENDOR_ID,
             REG_DEVICE_FEATURES => {
+                let feats = self.device_features();
                 if self.device_features_sel == 0 {
-                    (DEVICE_FEATURES & 0xffff_ffff) as u32
+                    (feats & 0xffff_ffff) as u32
                 } else {
-                    (DEVICE_FEATURES >> 32) as u32
+                    (feats >> 32) as u32
                 }
             }
             REG_QUEUE_NUM_MAX => {
@@ -239,9 +289,9 @@ impl VirtioBlock {
                     self.reset();
                 } else {
                     self.status = value as u8;
-                    // Validate negotiated features once FEATURES_OK is set.
                     if self.status & STATUS_FEATURES_OK != 0 {
-                        let unknown = self.driver_features & !DEVICE_FEATURES;
+                        let offered = self.device_features();
+                        let unknown = self.driver_features & !offered;
                         if unknown != 0 || (self.driver_features & VIRTIO_F_VERSION_1) == 0 {
                             self.status &= !STATUS_FEATURES_OK;
                             self.status |= STATUS_FAILED;
@@ -279,7 +329,7 @@ impl VirtioBlock {
                     self.queue.set_used_ring_address(None, Some(value));
                 }
             }
-            o if (REG_CONFIG..REG_CONFIG + 8).contains(&o) => {
+            o if (REG_CONFIG..REG_CONFIG + CONFIG_LEN as u64).contains(&o) => {
                 // config is read-only
                 let _ = access_len;
             }
@@ -306,7 +356,6 @@ impl VirtioBlock {
         let mut used_any = false;
         while let Some(chain) = self.queue.pop_descriptor_chain(mem) {
             let head = chain.head_index();
-            // Status byte is written inside `handle_request` on all paths that can.
             let written = self.handle_request(mem, chain).unwrap_or(1);
             self.queue
                 .add_used(mem, head, written)
@@ -333,7 +382,6 @@ impl VirtioBlock {
 
         match hdr.type_ {
             VIRTIO_BLK_T_IN => {
-                // Writable region = data + status byte.
                 let total = writer.available_bytes();
                 if total == 0 {
                     return Err(BlockReqError::Chain);
@@ -374,14 +422,17 @@ impl VirtioBlock {
                 let end = offset
                     .checked_add(data_len as u64)
                     .ok_or(BlockReqError::Io)?;
+
+                let readonly = self.readonly || (self.driver_features & VIRTIO_BLK_F_RO) != 0;
                 let out_of_range = end > self.capacity_sectors * SECTOR_SIZE;
-                let io_err = !out_of_range
+                let io_err = !readonly
+                    && !out_of_range
                     && self
                         .file
                         .seek(std::io::SeekFrom::Start(offset))
                         .and_then(|_| self.file.write_all(&buf))
                         .is_err();
-                let status = if out_of_range || io_err {
+                let status = if readonly || out_of_range || io_err {
                     VIRTIO_BLK_S_IOERR
                 } else {
                     VIRTIO_BLK_S_OK
@@ -390,10 +441,17 @@ impl VirtioBlock {
                 Ok(1)
             }
             VIRTIO_BLK_T_FLUSH => {
-                self.file.sync_all().map_err(|_| BlockReqError::Io)?;
-                writer
-                    .write_all(&[VIRTIO_BLK_S_OK])
-                    .map_err(|_| BlockReqError::Io)?;
+                // Durable commit of prior writes (fdatasync). OK as no-op on RO.
+                let status = if (self.driver_features & VIRTIO_BLK_F_FLUSH) == 0 {
+                    VIRTIO_BLK_S_UNSUPP
+                } else if self.readonly {
+                    VIRTIO_BLK_S_OK
+                } else if self.file.sync_data().is_err() {
+                    VIRTIO_BLK_S_IOERR
+                } else {
+                    VIRTIO_BLK_S_OK
+                };
+                writer.write_all(&[status]).map_err(|_| BlockReqError::Io)?;
                 Ok(1)
             }
             VIRTIO_BLK_T_GET_ID => {
