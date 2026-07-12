@@ -47,7 +47,7 @@ jobs:
       - name: Cache cargo
         uses: ./.github/actions/cache_cargo
       - name: Install guest tools
-        run: sudo apt-get update && sudo apt-get -y install busybox-static e2fsprogs wget cpio
+        run: sudo apt-get update && sudo apt-get -y install busybox-static e2fsprogs wget cpio iproute2
       - name: Enable KVM access
         run: |
           if [ -e /dev/kvm ]; then
@@ -57,18 +57,31 @@ jobs:
             echo "/dev/kvm missing"
             exit 1
           fi
+      - name: Prepare TAP for virtio-net e2e
+        run: |
+          # GitHub-hosted runners often disallow unshare user namespaces.
+          sudo ip link del kitsune-e2e0 2>/dev/null || true
+          sudo ip tuntap add mode tap name kitsune-e2e0 user "$USER"
+          sudo ip addr add 192.168.77.1/24 dev kitsune-e2e0
+          sudo ip link set kitsune-e2e0 up
+          ip -br addr show kitsune-e2e0
       - name: Cache guest artifacts
         uses: actions/cache@v6
         with:
           path: target/ci-guest
-          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v1
+          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v2-net
       - name: Prepare guest images
         run: bash scripts/ci_prepare_guest.sh target/ci-guest
       - name: Unit and integration tests
         env:
           KITSUNE_REQUIRE_KVM: "1"
           KITSUNE_GUEST_DIR: target/ci-guest
+          KITSUNE_TAP_NAME: kitsune-e2e0
         run: cargo test --release -- --nocapture
+      - name: Cleanup TAP
+        if: always()
+        continue-on-error: true
+        run: sudo ip link del kitsune-e2e0
       - name: Upload serial logs on failure
         if: failure()
         uses: actions/upload-artifact@v7
