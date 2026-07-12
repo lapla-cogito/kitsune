@@ -11,10 +11,31 @@ pub const VIRTIO_NET_IRQ: u32 = 6;
 
 const VIRTIO_ID_NET: u32 = 1;
 
+// Virtio-net feature bits (linux/virtio_net.h).
+const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
+const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
+const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
+const VIRTIO_NET_F_GUEST_ECN: u64 = 1 << 9;
+const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
+const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
+const VIRTIO_NET_F_HOST_ECN: u64 = 1 << 13;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
-const DEVICE_FEATURES: u64 =
+
+/// Features always offered (identity + link status).
+const BASE_FEATURES: u64 =
     super::virtio_mmio::VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+
+/// Offload features paired with TAP `TUNSETOFFLOAD`.
+const OFFLOAD_FEATURES: u64 = VIRTIO_NET_F_CSUM
+    | VIRTIO_NET_F_GUEST_CSUM
+    | VIRTIO_NET_F_HOST_TSO4
+    | VIRTIO_NET_F_HOST_TSO6
+    | VIRTIO_NET_F_HOST_ECN
+    | VIRTIO_NET_F_GUEST_TSO4
+    | VIRTIO_NET_F_GUEST_TSO6
+    | VIRTIO_NET_F_GUEST_ECN;
 
 const VIRTIO_NET_S_LINK_UP: u16 = 1;
 
@@ -25,12 +46,20 @@ const QUEUE_MAX_SIZE: u16 = 256;
 /// Linux uses `sizeof(virtio_net_hdr_mrg_rxbuf)` (= 12) whenever
 /// `VIRTIO_F_VERSION_1` is negotiated, even without `MRG_RXBUF`.
 const NET_HDR_LEN: usize = 12;
-/// Ethernet frame + virtio_net_hdr (no VLAN jumbo).
-const MAX_FRAME: usize = 1514 + NET_HDR_LEN;
+/// Max GSO payload (64 KiB) + Ethernet (+ VLAN) + virtio_net_hdr.
+const MAX_FRAME: usize = 65536 + 18 + NET_HDR_LEN;
 
+// TAP flags (linux/if_tun.h)
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFF_VNET_HDR: libc::c_short = 0x4000;
+
+// TUNSETOFFLOAD feature bits
+const TUN_F_CSUM: libc::c_uint = 0x01;
+const TUN_F_TSO4: libc::c_uint = 0x02;
+const TUN_F_TSO6: libc::c_uint = 0x04;
+const TUN_F_TSO_ECN: libc::c_uint = 0x08;
+const TUN_OFFLOADS: libc::c_uint = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_TSO_ECN;
 
 const CONFIG_SIZE: usize = 8; // mac[6] + status[2]
 
@@ -39,6 +68,8 @@ pub struct VirtioNet {
     mmio: super::virtio_mmio::VirtioMmio,
     tap: std::fs::File,
     mac: [u8; 6],
+    /// Scratch buffer for TAP reads (sized for GSO frames).
+    rx_scratch: Vec<u8>,
 }
 
 impl VirtioNet {
@@ -47,13 +78,14 @@ impl VirtioNet {
 
     /// Open or create TAP `ifname` and register IRQ `VIRTIO_NET_IRQ` with KVM.
     pub fn new(ifname: &str, vm: &kvm_ioctls::VmFd) -> crate::error::Result<Self> {
-        let tap = open_tap(ifname)?;
+        let (tap, offloads) = open_tap(ifname)?;
         let mac = mac_from_name(ifname);
+        let features = advertised_features(offloads);
 
         let mmio = super::virtio_mmio::VirtioMmio::new(
             VIRTIO_NET_MMIO_BASE,
             VIRTIO_ID_NET,
-            DEVICE_FEATURES,
+            features,
             2,
             QUEUE_MAX_SIZE,
         )
@@ -61,7 +93,12 @@ impl VirtioNet {
         mmio.register_irq(vm, VIRTIO_NET_IRQ)
             .map_err(crate::error::Error::KvmIoctl)?;
 
-        Ok(Self { mmio, tap, mac })
+        Ok(Self {
+            mmio,
+            tap,
+            mac,
+            rx_scratch: vec![0u8; MAX_FRAME],
+        })
     }
 
     pub fn handles(&self, addr: u64) -> bool {
@@ -104,16 +141,15 @@ impl VirtioNet {
             return Ok(());
         }
 
-        let mut frame = [0u8; MAX_FRAME];
         loop {
-            // With IFF_VNET_HDR, each read is virtio_net_hdr || eth frame.
-            match self.tap.read(&mut frame) {
+            // With IFF_VNET_HDR, each read is virtio_net_hdr || eth frame (possibly GSO).
+            match self.tap.read(&mut self.rx_scratch) {
                 Ok(0) => break,
                 Ok(n) if n < NET_HDR_LEN => {
                     // Truncated; drop.
                 }
                 Ok(n) => {
-                    if !self.deliver_rx(mem, &frame[..n])? {
+                    if !self.deliver_rx(mem, n)? {
                         // No RX buffer available; drop the frame.
                     }
                 }
@@ -162,6 +198,7 @@ impl VirtioNet {
                     .read_exact(&mut buf)
                     .map_err(|e| crate::error::Error::Net(e.to_string()))?;
                 // TAP with IFF_VNET_HDR expects virtio_net_hdr || eth frame in one write.
+                // Partial csum / GSO flags in the header are handled by the host kernel.
                 tap_write_packet(&mut self.tap, &buf)?;
             }
             self.mmio
@@ -179,11 +216,12 @@ impl VirtioNet {
         Ok(())
     }
 
+    /// Deliver `self.rx_scratch[..n]` into a guest RX buffer.
     /// Returns true if a guest RX buffer was consumed (filled or discarded).
     fn deliver_rx(
         &mut self,
         mem: &vm_memory::GuestMemoryMmap<()>,
-        frame: &[u8],
+        n: usize,
     ) -> crate::error::Result<bool> {
         let chain = {
             let Some(q) = self.mmio.queue_mut(QUEUE_RX) else {
@@ -197,6 +235,7 @@ impl VirtioNet {
         let head = chain.head_index();
         let mut writer = virtio_queue::Writer::new(mem, chain)
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
+        let frame = &self.rx_scratch[..n];
         let used_len = if writer.available_bytes() < frame.len() {
             0
         } else {
@@ -242,7 +281,9 @@ struct IfReq {
     _pad: [u8; 22],
 }
 
-fn open_tap(ifname: &str) -> crate::error::Result<std::fs::File> {
+/// Open TAP and enable offloads when the kernel supports them.
+/// Returns `(file, offloads_enabled)`.
+fn open_tap(ifname: &str) -> crate::error::Result<(std::fs::File, bool)> {
     if ifname.is_empty() || ifname.len() >= 16 {
         return Err(crate::error::Error::Net(
             "TAP interface name must be 1..15 bytes".into(),
@@ -278,6 +319,8 @@ fn open_tap(ifname: &str) -> crate::error::Result<std::fs::File> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
     // TUNSETVNETHDRSZ = _IOW('T', 216, int)
     const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
+    // TUNSETOFFLOAD = _IOW('T', 208, unsigned int)
+    const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
 
     // SAFETY: ioctl with a valid fd and ifreq for TUNSETIFF.
     let rc = unsafe { libc::ioctl(owned.as_raw_fd(), TUNSETIFF, &mut ifr) };
@@ -298,8 +341,27 @@ fn open_tap(ifname: &str) -> crate::error::Result<std::fs::File> {
         )));
     }
 
+    // SAFETY: enable checksum / TSO offloads on the TAP (GSO path for virtio_net_hdr).
+    let offloads = TUN_OFFLOADS;
+    let rc = unsafe { libc::ioctl(owned.as_raw_fd(), TUNSETOFFLOAD, offloads) };
+    let offloads_ok = if rc < 0 {
+        // Fall back to no offload features; basic frames still work.
+        false
+    } else {
+        true
+    };
+
     // SAFETY: OwnedFd is consumed into a File.
-    Ok(unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) })
+    let file = unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) };
+    Ok((file, offloads_ok))
+}
+
+fn advertised_features(offloads: bool) -> u64 {
+    if offloads {
+        BASE_FEATURES | OFFLOAD_FEATURES
+    } else {
+        BASE_FEATURES
+    }
 }
 
 fn mac_from_name(ifname: &str) -> [u8; 6] {
@@ -314,4 +376,34 @@ fn mac_from_name(ifname: &str) -> [u8; 6] {
     mac[4] = ((h >> 8) & 0xff) as u8;
     mac[5] = (h & 0xff) as u8;
     mac
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn features_include_offloads_when_enabled() {
+        let base = super::advertised_features(false);
+        assert_eq!(base & super::OFFLOAD_FEATURES, 0);
+        assert_ne!(base & super::VIRTIO_NET_F_MAC, 0);
+        assert_ne!(base & (1u64 << 32), 0);
+
+        let full = super::advertised_features(true);
+        assert_ne!(full & super::VIRTIO_NET_F_CSUM, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_GUEST_CSUM, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_HOST_TSO4, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_HOST_TSO6, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_GUEST_TSO4, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_GUEST_TSO6, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_HOST_ECN, 0);
+        assert_ne!(full & super::VIRTIO_NET_F_GUEST_ECN, 0);
+        // UFO / USO / MRG_RXBUF not advertised yet.
+        assert_eq!(full & (1 << 10), 0);
+        assert_eq!(full & (1 << 14), 0);
+        assert_eq!(full & (1 << 15), 0);
+    }
+
+    #[test]
+    fn max_frame_fits_gso() {
+        const { assert!(super::MAX_FRAME >= 65536 + super::NET_HDR_LEN) };
+    }
 }
