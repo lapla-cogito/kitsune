@@ -1,12 +1,35 @@
-//! Spawn kitsune with a TAP device inside a user network namespace.
+//! Spawn kitsune with a TAP device for virtio-net e2e.
 
 #[path = "pipe.rs"]
 mod pipe;
 
 pub use pipe::assert_contains;
 
-/// Like `run::run_until`, but creates a TAP under `unshare --user --net --map-root-user`.
+/// Run kitsune with TAP until timeout or all markers appear.
 pub fn run_until_with_tap(args: &[&str], timeout: std::time::Duration, markers: &[&str]) -> String {
+    if let Ok(tap) = std::env::var("KITSUNE_TAP_NAME") {
+        return run_with_existing_tap(&tap, args, timeout, markers);
+    }
+    run_with_unshare_tap(args, timeout, markers)
+}
+
+fn run_with_existing_tap(
+    tap: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+    markers: &[&str],
+) -> String {
+    let mut owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    owned.push("--tap".to_string());
+    owned.push(tap.to_string());
+    let refs: Vec<&str> = owned.iter().map(std::string::String::as_str).collect();
+
+    let mut cmd = std::process::Command::new(pipe::kitsune_bin());
+    cmd.args(refs);
+    spawn_and_wait(&mut cmd, timeout, markers)
+}
+
+fn run_with_unshare_tap(args: &[&str], timeout: std::time::Duration, markers: &[&str]) -> String {
     let bin = pipe::kitsune_bin();
     let wrapper = std::path::Path::new("scripts/ci_run_with_tap.sh");
     assert!(
@@ -20,18 +43,35 @@ pub fn run_until_with_tap(args: &[&str], timeout: std::time::Duration, markers: 
         .arg("bash")
         .arg(wrapper)
         .arg(&bin)
-        .args(args)
+        .args(args);
+
+    let out = spawn_and_wait(&mut cmd, timeout, markers);
+    if out.contains("uid_map") && out.contains("Operation not permitted") {
+        panic!(
+            "unshare user namespaces are disabled here; pre-create a TAP and set \
+             KITSUNE_TAP_NAME (see .github/workflows/ci.yml).\n--- output ---\n{out}"
+        );
+    }
+    out
+}
+
+fn spawn_and_wait(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+    markers: &[&str],
+) -> String {
+    let mut child = match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = match cmd.spawn() {
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => {
             if std::env::var_os("KITSUNE_REQUIRE_KVM").is_some() {
-                panic!("failed to spawn unshare for TAP e2e: {e}");
+                panic!("failed to spawn virtio-net e2e command: {e}");
             }
-            eprintln!("skipping: unshare not available ({e})");
+            eprintln!("skipping: cannot spawn virtio-net e2e ({e})");
             std::process::exit(0);
         }
     };
