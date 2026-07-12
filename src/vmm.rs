@@ -188,8 +188,11 @@ impl Vmm {
                 .expect("serial console is installed at construction"),
         ));
         let block = std::sync::Arc::new(std::sync::Mutex::new(self.block.take()));
-        let net = std::sync::Arc::new(std::sync::Mutex::new(self.net.take()));
         let mem = self.guest_mem.clone();
+        let net = self.net.take().map(std::sync::Arc::new);
+        if let Some(net) = net.as_ref() {
+            net.start_worker(mem.clone())?;
+        }
         let exit_on_hlt = self.exit_on_hlt;
 
         let mut vcpus = std::mem::take(&mut self.vcpus);
@@ -205,7 +208,7 @@ impl Vmm {
                 stop: std::sync::Arc::clone(&stop),
                 serial: std::sync::Arc::clone(&serial),
                 block: std::sync::Arc::clone(&block),
-                net: std::sync::Arc::clone(&net),
+                net: net.clone(),
                 mem: mem.clone(),
             };
             handles.push(
@@ -225,7 +228,7 @@ impl Vmm {
                 stop: std::sync::Arc::clone(&stop),
                 serial: std::sync::Arc::clone(&serial),
                 block: std::sync::Arc::clone(&block),
-                net: std::sync::Arc::clone(&net),
+                net: net.clone(),
                 mem,
             },
         );
@@ -251,15 +254,17 @@ impl Vmm {
             }
         }
 
+        if let Some(net) = net.as_ref() {
+            net.stop_worker();
+        }
+
         if let Ok(s) = std::sync::Arc::try_unwrap(serial) {
             self.serial = Some(s.into_inner().unwrap_or_else(|e| e.into_inner()));
         }
         if let Ok(b) = std::sync::Arc::try_unwrap(block) {
             self.block = b.into_inner().unwrap_or_else(|e| e.into_inner());
         }
-        if let Ok(n) = std::sync::Arc::try_unwrap(net) {
-            self.net = n.into_inner().unwrap_or_else(|e| e.into_inner());
-        }
+        self.net = net.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
 
         match first_err {
             Some(e) => Err(e),
@@ -275,7 +280,7 @@ struct VcpuRunCtx {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
     block: std::sync::Arc<std::sync::Mutex<Option<crate::devices::VirtioBlock>>>,
-    net: std::sync::Arc<std::sync::Mutex<Option<crate::devices::VirtioNet>>>,
+    net: Option<std::sync::Arc<crate::devices::VirtioNet>>,
     mem: vm_memory::GuestMemoryMmap<()>,
 }
 
@@ -286,10 +291,6 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .poll_stdin()?;
-            let mut net = ctx.net.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(net) = net.as_mut() {
-                net.poll_tap(&ctx.mem)?;
-            }
         }
 
         let exit = match vcpu.run() {
@@ -347,11 +348,10 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                         continue;
                     }
                 }
-                let guard = ctx.net.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(dev) = guard.as_ref()
-                    && dev.handles(addr)
+                if let Some(net) = ctx.net.as_ref()
+                    && net.handles(addr)
                 {
-                    dev.read(addr, data);
+                    net.read(addr, data);
                 }
             }
             kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
@@ -364,11 +364,10 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                         continue;
                     }
                 }
-                let mut guard = ctx.net.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(dev) = guard.as_mut()
-                    && dev.handles(addr)
+                if let Some(net) = ctx.net.as_ref()
+                    && net.handles(addr)
                 {
-                    dev.write(addr, data, &ctx.mem)?;
+                    net.write(addr, data, &ctx.mem)?;
                 }
             }
             kvm_ioctls::VcpuExit::Hlt => {
