@@ -2,6 +2,7 @@
 
 mod serial;
 mod virtio_blk;
+mod virtio_mmio;
 mod virtio_net;
 
 pub(crate) use serial::SERIAL_IRQ;
