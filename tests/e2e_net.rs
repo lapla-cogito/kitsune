@@ -1,27 +1,21 @@
 //! End-to-end virtio-net (TAP + guest ping).
 
-#[path = "common/mod.rs"]
-mod common;
-
-fn ensure_guest() {
-    let dir = common::guest_dir();
-    // Always refresh initrd when prepare script stamp is missing (net markers).
-    let status = std::process::Command::new("bash")
-        .args(["scripts/ci_prepare_guest.sh", dir.to_str().unwrap()])
-        .status()
-        .expect("run ci_prepare_guest.sh");
-    assert!(status.success(), "ci_prepare_guest.sh failed");
-}
+#[path = "support/guest.rs"]
+mod guest;
+#[path = "support/kvm.rs"]
+mod kvm;
+#[path = "support/run_tap.rs"]
+mod run_tap;
 
 #[test]
 fn boot_with_tap_ping_host() {
-    common::require_kvm();
-    ensure_guest();
-    let dir = common::guest_dir();
+    kvm::require_kvm();
+    guest::prepare_guest();
+    let dir = guest::guest_dir();
     let kernel = dir.join("vmlinux");
     let initrd = dir.join("initrd.img");
 
-    let out = common::run_until_with_tap(
+    let out = run_tap::run_until_with_tap(
         &[
             "run",
             "--kernel",
@@ -36,6 +30,6 @@ fn boot_with_tap_ping_host() {
         std::time::Duration::from_secs(90),
         &["kitsune-initrd-ok", "kitsune-net-ok"],
     );
-    common::assert_contains(&out, "kitsune-initrd-ok");
-    common::assert_contains(&out, "kitsune-net-ok");
+    run_tap::assert_contains(&out, "kitsune-initrd-ok");
+    run_tap::assert_contains(&out, "kitsune-net-ok");
 }
