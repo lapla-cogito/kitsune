@@ -47,7 +47,7 @@ jobs:
       - name: Cache cargo
         uses: ./.github/actions/cache_cargo
       - name: Install guest tools
-        run: sudo apt-get update && sudo apt-get -y install busybox-static e2fsprogs wget cpio
+        run: sudo apt-get update && sudo apt-get -y install busybox-static e2fsprogs wget cpio iproute2
       - name: Enable KVM access
         run: |
           if [ -e /dev/kvm ]; then
@@ -61,7 +61,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: target/ci-guest
-          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v1
+          key: ${{ runner.os }}-guest-vmlinux-6.18.36-v2-net
       - name: Prepare guest images
         run: bash scripts/ci_prepare_guest.sh target/ci-guest
       - name: Unit and integration tests
