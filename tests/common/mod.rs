@@ -1,7 +1,5 @@
 //! Shared helpers for integration tests.
 
-use std::io::Read as _;
-
 pub fn guest_dir() -> std::path::PathBuf {
     std::env::var_os("KITSUNE_GUEST_DIR")
         .map(std::path::PathBuf::from)
@@ -37,6 +35,25 @@ pub fn kitsune_bin() -> std::path::PathBuf {
         .expect("CARGO_BIN_EXE_kitsune (run via cargo test)")
 }
 
+fn drain_pipe(
+    mut pipe: impl std::io::Read + Send + 'static,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 /// Run kitsune until `timeout` or all `markers` appear in the combined output.
 pub fn run_until(args: &[&str], timeout: std::time::Duration, markers: &[&str]) -> String {
     let mut child = std::process::Command::new(kitsune_bin())
@@ -47,49 +64,50 @@ pub fn run_until(args: &[&str], timeout: std::time::Duration, markers: &[&str]) 
         .spawn()
         .expect("spawn kitsune");
 
-    let start = std::time::Instant::now();
-    let mut stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let mut buf = [0u8; 4096];
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let err = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    drain_pipe(
+        child.stdout.take().expect("stdout"),
+        std::sync::Arc::clone(&out),
+    );
+    drain_pipe(
+        child.stderr.take().expect("stderr"),
+        std::sync::Arc::clone(&err),
+    );
 
+    let start = std::time::Instant::now();
     loop {
         if start.elapsed() >= timeout {
             let _ = child.kill();
             break;
         }
-        match stdout.read(&mut buf) {
-            Ok(0) => {}
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(_) => {}
-        }
-        match stderr.read(&mut buf) {
-            Ok(0) => {}
-            Ok(n) => err.extend_from_slice(&buf[..n]),
-            Err(_) => {}
-        }
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let _ = stdout.read_to_end(&mut out);
-                let _ = stderr.read_to_end(&mut err);
-                break;
-            }
-            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
 
-        let combined = String::from_utf8_lossy(&out);
+        let combined = {
+            let o = out.lock().unwrap_or_else(|e| e.into_inner());
+            let e = err.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = String::from_utf8_lossy(&o).into_owned();
+            s.push_str(&String::from_utf8_lossy(&e));
+            s
+        };
         if !markers.is_empty() && markers.iter().all(|m| combined.contains(m)) {
             let _ = child.kill();
-            let _ = stdout.read_to_end(&mut out);
-            let _ = stderr.read_to_end(&mut err);
             break;
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => break,
         }
     }
     let _ = child.wait();
+    // Allow drain threads to finish after EOF.
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let mut s = String::from_utf8_lossy(&out).into_owned();
-    s.push_str(&String::from_utf8_lossy(&err));
+    let o = out.lock().unwrap_or_else(|e| e.into_inner());
+    let e = err.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = String::from_utf8_lossy(&o).into_owned();
+    s.push_str(&String::from_utf8_lossy(&e));
     s
 }
 
