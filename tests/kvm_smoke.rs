@@ -24,7 +24,7 @@ fn require_kvm() {
 }
 
 #[test]
-fn create_vm_and_hlt() {
+fn create_vm_and_debug_exit() {
     require_kvm();
 
     let config = kitsune::VmmConfig {
@@ -32,7 +32,13 @@ fn create_vm_and_hlt() {
         num_vcpus: 1,
     };
     let mut vmm = kitsune::Vmm::new(&config).expect("Vmm::new");
-    // Real-mode single-byte program: HLT
-    vmm.load_flat_binary(&[0xf4], 0, 0).expect("load");
-    vmm.run().expect("run to hlt");
+    // Real mode: OUT 0x00 to port 0x501 (isa-debug-exit style), then optional HLT.
+    // HLT alone is handled in-kernel when irqchip/PIT is enabled, so it is not a
+    // reliable userspace stop signal.
+    //   mov dx, 0x501
+    //   xor al, al
+    //   out dx, al
+    let code = [0xba, 0x01, 0x05, 0x30, 0xc0, 0xee];
+    vmm.load_flat_binary(&code, 0, 0).expect("load");
+    vmm.run().expect("run to debug exit");
 }

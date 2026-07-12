@@ -1,6 +1,10 @@
 use vm_memory::GuestMemoryBackend as _;
 use vm_memory::bytes::Bytes as _;
 
+/// I/O port used as a guest -> host stop request in flat-binary mode (`exit_on_hlt`).
+/// Compatible with QEMU `isa-debug-exit` (write 0 = success).
+const DEBUG_EXIT_IOPORT: u16 = 0x501;
+
 /// Virtual machine monitor instance.
 ///
 /// Field order is intentional: `guest_mem` must outlive `vm`/`vcpus` so KVM
@@ -305,6 +309,17 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
 
         match exit {
             kvm_ioctls::VcpuExit::IoOut(port, data) => {
+                if ctx.exit_on_hlt && port == DEBUG_EXIT_IOPORT {
+                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let code = data.first().copied().unwrap_or(0);
+                    if code != 0 {
+                        return Err(crate::error::Error::UnexpectedExit(format!(
+                            "vcpu{} debug exit status {code}",
+                            ctx.id
+                        )));
+                    }
+                    break;
+                }
                 if crate::devices::SerialConsole::handles_port(port) {
                     ctx.serial
                         .lock()
