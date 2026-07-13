@@ -14,10 +14,9 @@ fi
 if [ -e /dev/vda ]; then
   echo "kitsune-blk-ok"
 fi
-# virtio-net: offload features, static addressing, then ping the host TAP side.
+# virtio-net: offload features, static addressing, then host reachability tests.
 if [ -d /sys/class/net/eth0 ]; then
   # Negotiated virtio features: 64 chars of 0/1, index = feature bit.
-  # Prefer eth0's parent device; fall back to scanning virtio bus for net (id 1).
   feats=""
   if [ -r /sys/class/net/eth0/device/features ]; then
     feats=$(cat /sys/class/net/eth0/device/features | tr -d '\n')
@@ -48,12 +47,39 @@ if [ -d /sys/class/net/eth0 ]; then
 
   ip link set eth0 up
   ip addr add 192.168.77.2/24 dev eth0
-  # BusyBox ping: -c count, -W seconds per reply (if supported).
-  if ping -c 3 -W 2 192.168.77.1 >/dev/null 2>&1 \
+
+  # ICMP: basic reachability.
+  if ping -c 3 -W 1 192.168.77.1 >/dev/null 2>&1 \
     || ping -c 3 192.168.77.1 >/dev/null 2>&1; then
     echo "kitsune-net-ok"
   else
     echo "kitsune-net-fail"
+  fi
+
+  tcp_ok=0
+  for _ in 1 2 3; do
+    resp=$(printf 'x\n' | nc -w 1 192.168.77.1 7777 2>/dev/null) \
+      || resp=$(printf 'x\n' | nc 192.168.77.1 7777 2>/dev/null) \
+      || resp=""
+    case "$resp" in
+      *kitsune-host-tcp-ok*)
+        tcp_ok=1
+        break
+        ;;
+    esac
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+  if [ "$tcp_ok" = 1 ]; then
+    echo "kitsune-net-tcp-ok"
+  else
+    echo "kitsune-net-tcp-fail"
+  fi
+
+  if ping -c 20 -W 1 192.168.77.1 >/dev/null 2>&1 \
+    || ping -c 20 192.168.77.1 >/dev/null 2>&1; then
+    echo "kitsune-net-bulk-ok"
+  else
+    echo "kitsune-net-bulk-fail"
   fi
 fi
 while true; do sleep 3600; done

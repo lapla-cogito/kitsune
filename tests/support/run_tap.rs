@@ -1,5 +1,7 @@
 //! Spawn kitsune with a TAP device for virtio-net e2e.
 
+#[path = "host_tcp.rs"]
+mod host_tcp;
 #[path = "pipe.rs"]
 mod pipe;
 
@@ -25,6 +27,18 @@ fn run_with_existing_tap(
     timeout: std::time::Duration,
     markers: &[&str],
 ) -> String {
+    // TAP IP is preconfigured on the host (CI); serve TCP for guest clients.
+    let _tcp = match host_tcp::HostTcpService::start(host_tcp::DEFAULT_ADDR) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "warning: host TCP helper on {}: {e} (TCP e2e markers may fail)",
+                host_tcp::DEFAULT_ADDR
+            );
+            None
+        }
+    };
+
     let mut owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     owned.push("--tap".to_string());
     owned.push(tap.to_string());
