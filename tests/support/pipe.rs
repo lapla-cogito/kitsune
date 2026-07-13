@@ -19,6 +19,49 @@ pub fn drain_pipe(
     });
 }
 
+/// Whether to print captured guest serial (CI, or `KITSUNE_E2E_LOG=1`).
+pub fn e2e_log_enabled() -> bool {
+    std::env::var_os("KITSUNE_E2E_LOG").is_some() || std::env::var_os("CI").is_some()
+}
+
+/// Print and optionally save combined guest serial / kitsune stderr.
+pub fn dump_guest_serial(markers: &[&str], serial: &str) {
+    if !e2e_log_enabled() {
+        return;
+    }
+    let tag = if markers.is_empty() {
+        "e2e".to_string()
+    } else {
+        markers.join(",")
+    };
+    eprintln!("===== guest serial [{tag}] begin =====");
+    eprint!("{serial}");
+    if !serial.ends_with('\n') {
+        eprintln!();
+    }
+    eprintln!("===== guest serial [{tag}] end =====");
+
+    if let Ok(dir) = std::env::var("KITSUNE_GUEST_DIR") {
+        let log_dir = std::path::Path::new(&dir).join("e2e-logs");
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let name = markers
+                .first()
+                .copied()
+                .unwrap_or("e2e")
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>();
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = log_dir.join(format!("{name}-{stamp}.log"));
+            let _ = std::fs::write(&path, serial);
+            eprintln!("guest serial saved to {}", path.display());
+        }
+    }
+}
+
 pub fn wait_child(
     mut child: std::process::Child,
     out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -58,6 +101,7 @@ pub fn wait_child(
     let e = err.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = String::from_utf8_lossy(&o).into_owned();
     s.push_str(&String::from_utf8_lossy(&e));
+    dump_guest_serial(markers, &s);
     s
 }
 
