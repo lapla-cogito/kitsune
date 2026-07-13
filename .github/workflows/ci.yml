@@ -80,15 +80,16 @@ jobs:
           KITSUNE_REQUIRE_KVM: "1"
           KITSUNE_GUEST_DIR: target/ci-guest
           KITSUNE_TAP_NAME: kitsune-e2e0
-        run: cargo test --release -- --nocapture
+          KITSUNE_E2E_LOG: "1"
+        run: cargo test --release -- --nocapture --test-threads=1
       - name: Cleanup TAP
         if: always()
         continue-on-error: true
         run: sudo ip link del kitsune-e2e0
-      - name: Upload serial logs on failure
+      - name: Upload e2e serial logs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: ci-guest-artifacts
-          path: target/ci-guest/
+          name: e2e-serial-logs
+          path: target/ci-guest/e2e-logs/
           if-no-files-found: ignore
