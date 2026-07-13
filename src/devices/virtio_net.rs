@@ -69,6 +69,7 @@ struct NetState {
     tap: std::fs::File,
     mac: [u8; 6],
     rx_scratch: Vec<u8>,
+    tx_scratch: Vec<u8>,
 }
 
 /// Virtio-mmio network device using a host TAP interface.
@@ -112,6 +113,7 @@ impl VirtioNet {
                 tap,
                 mac,
                 rx_scratch: vec![0u8; MAX_FRAME],
+                tx_scratch: Vec::with_capacity(MAX_FRAME),
             })),
             kick,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -238,11 +240,15 @@ fn worker_loop(
             let _ = kick.read();
         }
 
-        // TX/RX under the device lock only; poll itself never holds it.
-        // Always drain both: TX notify, guest RX refill, or TAP frames may race.
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        process_tx(&mut guard, &mem)?;
-        poll_tap(&mut guard, &mem)?;
+        let mut need_irq = process_tx(&mut guard, &mem)?;
+        need_irq |= poll_tap(&mut guard, &mem)?;
+        if need_irq {
+            guard
+                .mmio
+                .signal_used_queue()
+                .map_err(crate::error::Error::Net)?;
+        }
     }
     Ok(())
 }
@@ -250,13 +256,13 @@ fn worker_loop(
 fn process_tx(
     state: &mut NetState,
     mem: &vm_memory::GuestMemoryMmap<()>,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<bool> {
     let tx_ready = state
         .mmio
         .queue(QUEUE_TX)
         .is_some_and(virtio_queue::QueueT::ready);
     if !tx_ready {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut used_any = false;
@@ -275,12 +281,14 @@ fn process_tx(
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
         let total = reader.available_bytes();
         if total >= NET_HDR_LEN {
-            let mut buf = vec![0u8; total];
+            if state.tx_scratch.len() < total {
+                state.tx_scratch.resize(total, 0);
+            }
             reader
-                .read_exact(&mut buf)
+                .read_exact(&mut state.tx_scratch[..total])
                 .map_err(|e| crate::error::Error::Net(e.to_string()))?;
             // TAP with IFF_VNET_HDR expects virtio_net_hdr || eth frame in one write.
-            tap_write_packet(&mut state.tap, &buf)?;
+            tap_write_packet(&mut state.tap, &state.tx_scratch[..total])?;
         }
         state
             .mmio
@@ -290,34 +298,29 @@ fn process_tx(
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
         used_any = true;
     }
-    if used_any {
-        state
-            .mmio
-            .signal_used_queue()
-            .map_err(crate::error::Error::Net)?;
-    }
-    Ok(())
+    Ok(used_any)
 }
 
 fn poll_tap(
     state: &mut NetState,
     mem: &vm_memory::GuestMemoryMmap<()>,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<bool> {
     let rx_ready = state
         .mmio
         .queue(QUEUE_RX)
         .is_some_and(virtio_queue::QueueT::ready);
     if !rx_ready {
-        return Ok(());
+        return Ok(false);
     }
 
+    let mut used_any = false;
     loop {
         match state.tap.read(&mut state.rx_scratch) {
             Ok(0) => break,
             Ok(n) if n < NET_HDR_LEN => {}
             Ok(n) => {
-                if !deliver_rx(state, mem, n)? {
-                    // No RX buffer; drop frame.
+                if deliver_rx(state, mem, n)? {
+                    used_any = true;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -325,7 +328,7 @@ fn poll_tap(
             Err(e) => return Err(crate::error::Error::Net(format!("tap read: {e}"))),
         }
     }
-    Ok(())
+    Ok(used_any)
 }
 
 fn deliver_rx(
@@ -360,10 +363,6 @@ fn deliver_rx(
         .ok_or_else(|| crate::error::Error::Net("missing rx queue".into()))?
         .add_used(mem, head, used_len)
         .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-    state
-        .mmio
-        .signal_used_queue()
-        .map_err(crate::error::Error::Net)?;
     Ok(true)
 }
 
