@@ -187,7 +187,10 @@ impl Vmm {
                 .take()
                 .expect("serial console is installed at construction"),
         ));
-        let block = std::sync::Arc::new(std::sync::Mutex::new(self.block.take()));
+        let block = self.block.take().map(std::sync::Arc::new);
+        if let Some(block) = block.as_ref() {
+            block.start_worker(self.guest_mem.clone())?;
+        }
         let mem = self.guest_mem.clone();
         let net = self.net.take().map(std::sync::Arc::new);
         if let Some(net) = net.as_ref() {
@@ -207,7 +210,7 @@ impl Vmm {
                 exit_on_hlt: false,
                 stop: std::sync::Arc::clone(&stop),
                 serial: std::sync::Arc::clone(&serial),
-                block: std::sync::Arc::clone(&block),
+                block: block.clone(),
                 net: net.clone(),
                 mem: mem.clone(),
             };
@@ -227,7 +230,7 @@ impl Vmm {
                 exit_on_hlt,
                 stop: std::sync::Arc::clone(&stop),
                 serial: std::sync::Arc::clone(&serial),
-                block: std::sync::Arc::clone(&block),
+                block: block.clone(),
                 net: net.clone(),
                 mem,
             },
@@ -254,16 +257,23 @@ impl Vmm {
             }
         }
 
-        if let Some(net) = net.as_ref() {
-            net.stop_worker();
+        if let Some(block) = block.as_ref()
+            && let Err(e) = block.stop_worker()
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+        if let Some(net) = net.as_ref()
+            && let Err(e) = net.stop_worker()
+            && first_err.is_none()
+        {
+            first_err = Some(e);
         }
 
         if let Ok(s) = std::sync::Arc::try_unwrap(serial) {
             self.serial = Some(s.into_inner().unwrap_or_else(|e| e.into_inner()));
         }
-        if let Ok(b) = std::sync::Arc::try_unwrap(block) {
-            self.block = b.into_inner().unwrap_or_else(|e| e.into_inner());
-        }
+        self.block = block.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
         self.net = net.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
 
         match first_err {
@@ -279,7 +289,7 @@ struct VcpuRunCtx {
     exit_on_hlt: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
-    block: std::sync::Arc<std::sync::Mutex<Option<crate::devices::VirtioBlock>>>,
+    block: Option<std::sync::Arc<crate::devices::VirtioBlock>>,
     net: Option<std::sync::Arc<crate::devices::VirtioNet>>,
     mem: vm_memory::GuestMemoryMmap<()>,
 }
@@ -339,14 +349,11 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 }
             }
             kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
+                if let Some(dev) = ctx.block.as_ref()
+                    && dev.handles(addr)
                 {
-                    let guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(dev) = guard.as_ref()
-                        && dev.handles(addr)
-                    {
-                        dev.read(addr, data);
-                        continue;
-                    }
+                    dev.read(addr, data);
+                    continue;
                 }
                 if let Some(net) = ctx.net.as_ref()
                     && net.handles(addr)
@@ -355,14 +362,11 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 }
             }
             kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
+                if let Some(dev) = ctx.block.as_ref()
+                    && dev.handles(addr)
                 {
-                    let mut guard = ctx.block.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(dev) = guard.as_mut()
-                        && dev.handles(addr)
-                    {
-                        dev.write(addr, data, &ctx.mem)?;
-                        continue;
-                    }
+                    dev.write(addr, data, &ctx.mem)?;
+                    continue;
                 }
                 if let Some(net) = ctx.net.as_ref()
                     && net.handles(addr)

@@ -76,7 +76,7 @@ struct NetState {
 pub struct VirtioNet {
     base: u64,
     state: std::sync::Arc<std::sync::Mutex<NetState>>,
-    /// Wakes the worker on queue notify (and on stop).
+    /// Clone of the transport notify EventFd (ioeventfd + software kick / stop).
     kick: vmm_sys_util::eventfd::EventFd,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<crate::error::Result<()>>>>,
@@ -102,8 +102,13 @@ impl VirtioNet {
         .map_err(crate::error::Error::Net)?;
         mmio.register_irq(vm, VIRTIO_NET_IRQ)
             .map_err(crate::error::Error::KvmIoctl)?;
+        mmio.register_ioeventfds(vm)
+            .map_err(crate::error::Error::KvmIoctl)?;
 
-        let kick = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+        // Same EventFd KVM signals on QueueNotify (ioeventfd) and we use for stop.
+        let kick = mmio
+            .notify_fd()
+            .try_clone()
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
 
         Ok(Self {
@@ -145,11 +150,18 @@ impl VirtioNet {
     }
 
     /// Stop the worker and wait for it to exit.
-    pub fn stop_worker(&self) {
+    pub fn stop_worker(&self) -> crate::error::Result<()> {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.kick.write(1);
-        if let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = handle.join();
+        let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return Ok(());
+        };
+        match handle.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(crate::error::Error::Net(
+                "virtio-net worker panicked".into(),
+            )),
         }
     }
 
@@ -177,7 +189,6 @@ impl VirtioNet {
                 .map_err(crate::error::Error::Net)?
         };
         if notify.is_some() {
-            // Datapath runs on the worker; only kick if it is (or will be) running.
             self.kick
                 .write(1)
                 .map_err(|e| crate::error::Error::Net(e.to_string()))?;
@@ -188,7 +199,7 @@ impl VirtioNet {
 
 impl Drop for VirtioNet {
     fn drop(&mut self) {
-        self.stop_worker();
+        let _ = self.stop_worker();
     }
 }
 
@@ -235,20 +246,37 @@ fn worker_loop(
             return Err(crate::error::Error::Net(format!("poll: {err}")));
         }
 
-        if fds[1].revents != 0 {
+        let kick_ready = fds[1].revents != 0;
+        if kick_ready {
             // Clear kick; coalesced notifies are fine.
             let _ = kick.read();
         }
-
-        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut need_irq = process_tx(&mut guard, &mem)?;
-        need_irq |= poll_tap(&mut guard, &mem)?;
-        if need_irq {
-            guard
-                .mmio
-                .signal_used_queue()
-                .map_err(crate::error::Error::Net)?;
+        let tap_ready = fds[0].revents != 0;
+        // Process when the guest notified, TAP has data, or either revent fired.
+        if !kick_ready && !tap_ready {
+            continue;
         }
+
+        // Datapath errors are logged and retried; only poll failures are fatal.
+        if let Err(e) = process_net_once(&state, &mem) {
+            eprintln!("kitsune: virtio-net: {e}");
+        }
+    }
+    Ok(())
+}
+
+fn process_net_once(
+    state: &std::sync::Arc<std::sync::Mutex<NetState>>,
+    mem: &vm_memory::GuestMemoryMmap<()>,
+) -> crate::error::Result<()> {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut need_irq = process_tx(&mut guard, mem)?;
+    need_irq |= poll_tap(&mut guard, mem)?;
+    if need_irq {
+        guard
+            .mmio
+            .signal_used_queue()
+            .map_err(crate::error::Error::Net)?;
     }
     Ok(())
 }
