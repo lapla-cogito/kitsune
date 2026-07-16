@@ -28,7 +28,8 @@ const REG_QUEUE_SEL: u64 = 0x30;
 const REG_QUEUE_NUM_MAX: u64 = 0x34;
 const REG_QUEUE_NUM: u64 = 0x38;
 const REG_QUEUE_READY: u64 = 0x44;
-const REG_QUEUE_NOTIFY: u64 = 0x50;
+/// Guest writes the queue index here to notify the device.
+pub const REG_QUEUE_NOTIFY: u64 = 0x50;
 const REG_INTERRUPT_STATUS: u64 = 0x60;
 const REG_INTERRUPT_ACK: u64 = 0x64;
 const REG_STATUS: u64 = 0x70;
@@ -54,11 +55,14 @@ pub struct VirtioMmio {
     queue_sel: u32,
     interrupt_status: u32,
     irq_fd: vmm_sys_util::eventfd::EventFd,
+    /// Signaled by KVM ioeventfd on `QueueNotify` writes (and software kicks).
+    notify_fd: vmm_sys_util::eventfd::EventFd,
     queues: Vec<virtio_queue::Queue>,
 }
 
 impl VirtioMmio {
-    /// Create transport registers and queues. Call [`register_irq`] before the guest runs.
+    /// Create transport registers and queues.
+    /// Call [`register_irq`] and [`register_ioeventfds`] before the guest runs.
     pub fn new(
         base: u64,
         device_id: u32,
@@ -70,6 +74,8 @@ impl VirtioMmio {
             return Err("virtio-mmio requires at least one queue".into());
         }
         let irq_fd =
+            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).map_err(|e| e.to_string())?;
+        let notify_fd =
             vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).map_err(|e| e.to_string())?;
 
         let mut queues = Vec::with_capacity(num_queues);
@@ -88,6 +94,7 @@ impl VirtioMmio {
             queue_sel: 0,
             interrupt_status: 0,
             irq_fd,
+            notify_fd,
             queues,
         })
     }
@@ -97,8 +104,19 @@ impl VirtioMmio {
         vm.register_irqfd(&self.irq_fd, irq)
     }
 
-    pub fn handles(&self, addr: u64) -> bool {
-        (self.base..self.base + MMIO_SIZE).contains(&addr)
+    /// Register KVM ioeventfds so guest writes to `QueueNotify` signal [`notify_fd`].
+    pub fn register_ioeventfds(&self, vm: &kvm_ioctls::VmFd) -> Result<(), kvm_ioctls::Error> {
+        let addr = kvm_ioctls::IoEventAddress::Mmio(self.base + REG_QUEUE_NOTIFY);
+        for index in 0..self.queues.len() {
+            vm.register_ioevent(&self.notify_fd, &addr, index as u32)?;
+        }
+        Ok(())
+    }
+
+    /// EventFd that fires when the guest notifies any queue via ioeventfd.
+    /// Devices also write this fd for software kick / stop and MMIO notify fallback.
+    pub fn notify_fd(&self) -> &vmm_sys_util::eventfd::EventFd {
+        &self.notify_fd
     }
 
     pub fn driver_features(&self) -> u64 {
@@ -127,7 +145,7 @@ impl VirtioMmio {
         write_le(data, self.read_reg(offset));
     }
 
-    /// Write MMIO registers. Returns `Some(queue_index)` when the guest notifies a queue.
+    /// Write MMIO registers.
     pub fn write(
         &mut self,
         addr: u64,
