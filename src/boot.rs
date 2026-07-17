@@ -1,4 +1,5 @@
 //! Load a Linux kernel and build boot parameters (x86_64 Linux boot protocol).
+
 use linux_loader::configurator::BootConfigurator as _;
 use linux_loader::loader::KernelLoader as _;
 use vm_memory::Address as _;

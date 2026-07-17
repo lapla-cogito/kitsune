@@ -1,7 +1,10 @@
 //! Virtio-mmio network device (virtio 1.0 modern) backed by a host TAP.
 
-use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
+use std::io::Read as _;
+use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
+use std::os::fd::FromRawFd as _;
+use std::os::fd::IntoRawFd as _;
 use virtio_queue::QueueT as _;
 
 /// MMIO base for the virtio-net device (after virtio-blk window).

@@ -1,7 +1,9 @@
 //! Virtio-mmio block device (virtio 1.0 modern transport).
 
-use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::io::Read as _;
+use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
+use std::os::fd::FromRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use virtio_queue::QueueT as _;
 

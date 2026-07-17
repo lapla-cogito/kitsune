@@ -12,8 +12,14 @@ mod vcpu;
 mod vmm;
 
 pub use boot::KernelBootConfig;
-pub use cmdline::{KernelCmdlineOpts, build_kernel_cmdline};
-pub use config::{DEFAULT_KERNEL_CMDLINE, INITRD_CMDLINE_EXTRA, MAX_VCPUS, VmmConfig};
-pub use devices::{VirtioBlock, VirtioNet};
-pub use error::{Error, Result};
+pub use cmdline::KernelCmdlineOpts;
+pub use cmdline::build_kernel_cmdline;
+pub use config::DEFAULT_KERNEL_CMDLINE;
+pub use config::INITRD_CMDLINE_EXTRA;
+pub use config::MAX_VCPUS;
+pub use config::VmmConfig;
+pub use devices::VirtioBlock;
+pub use devices::VirtioNet;
+pub use error::Error;
+pub use error::Result;
 pub use vmm::Vmm;
