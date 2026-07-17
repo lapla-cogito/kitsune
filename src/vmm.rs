@@ -5,6 +5,9 @@ use vm_memory::bytes::Bytes as _;
 /// Compatible with QEMU `isa-debug-exit` (write 0 = success).
 const DEBUG_EXIT_IOPORT: u16 = 0x501;
 
+/// Signal used to force `KVM_RUN` to return `EINTR` on vCPU threads (stop / join).
+const VCPU_KICK_SIGNUM: libc::c_int = libc::SIGUSR2;
+
 /// Virtual machine monitor instance.
 ///
 /// Field order is intentional: `guest_mem` must outlive `vm`/`vcpus` so KVM
@@ -80,6 +83,20 @@ impl Vmm {
             num_vcpus: config.num_vcpus,
             exit_on_hlt: true,
         })
+    }
+
+    /// Prefer in-kernel HLT handling so idle guests do not tight-loop in userspace.
+    fn try_disable_hlt_exits(vm: &kvm_ioctls::VmFd) -> bool {
+        let cap_id = kvm_bindings::KVM_CAP_X86_DISABLE_EXITS as i32;
+        if vm.check_extension_raw(cap_id as libc::c_ulong) <= 0 {
+            return false;
+        }
+        let mut cap = kvm_bindings::kvm_enable_cap {
+            cap: kvm_bindings::KVM_CAP_X86_DISABLE_EXITS,
+            ..Default::default()
+        };
+        cap.args[0] = u64::from(kvm_bindings::KVM_X86_DISABLE_EXITS_HLT);
+        vm.enable_cap(&cap).is_ok()
     }
 
     /// Attach a virtio-blk device backed by the given host path.
@@ -170,23 +187,25 @@ impl Vmm {
             ap.set_mp_state(mp).map_err(crate::error::Error::KvmIoctl)?;
         }
 
+        // Idle Linux guests HLT frequently. Handle HLT in-kernel when possible.
+        let _ = Self::try_disable_hlt_exits(&self.vm);
         self.exit_on_hlt = false;
         Ok(())
     }
 
     /// Run all vCPUs until the guest shuts down.
-    ///
-    /// The BSP runs on this thread (so the SIGALRM kick reaches its `KVM_RUN`).
-    /// Application processors run on background threads.
     pub fn run(&mut self) -> crate::error::Result<()> {
-        let _kick = KvmRunKickTimer::arm(20)?;
+        let _kick_handler = VcpuKickHandlerGuard::install()?;
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kick = std::sync::Arc::new(VcpuKickRegistry::new());
         let serial = std::sync::Arc::new(std::sync::Mutex::new(
             self.serial
                 .take()
                 .expect("serial console is installed at construction"),
         ));
+        let stdin_worker = crate::devices::StdinWorker::start(std::sync::Arc::clone(&serial))?;
+
         let block = self.block.take().map(std::sync::Arc::new);
         if let Some(block) = block.as_ref() {
             block.start_worker(self.guest_mem.clone())?;
@@ -206,9 +225,9 @@ impl Vmm {
             let id = (i + 1) as u8;
             let ctx = VcpuRunCtx {
                 id,
-                is_bsp: false,
                 exit_on_hlt: false,
                 stop: std::sync::Arc::clone(&stop),
+                kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
                 block: block.clone(),
                 net: net.clone(),
@@ -226,9 +245,9 @@ impl Vmm {
             bsp,
             VcpuRunCtx {
                 id: 0,
-                is_bsp: true,
                 exit_on_hlt,
                 stop: std::sync::Arc::clone(&stop),
+                kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
                 block: block.clone(),
                 net: net.clone(),
@@ -237,6 +256,7 @@ impl Vmm {
         );
         // Ensure AP threads leave their KVM_RUN loops.
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        kick.kick_all();
 
         let mut first_err = bsp_result.err();
         for handle in handles {
@@ -257,6 +277,11 @@ impl Vmm {
             }
         }
 
+        if let Err(e) = stdin_worker.stop()
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
         if let Some(block) = block.as_ref()
             && let Err(e) = block.stop_worker()
             && first_err.is_none()
@@ -285,9 +310,9 @@ impl Vmm {
 
 struct VcpuRunCtx {
     id: u8,
-    is_bsp: bool,
     exit_on_hlt: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    kick: std::sync::Arc<VcpuKickRegistry>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
     block: Option<std::sync::Arc<crate::devices::VirtioBlock>>,
     net: Option<std::sync::Arc<crate::devices::VirtioNet>>,
@@ -295,17 +320,12 @@ struct VcpuRunCtx {
 }
 
 fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error::Result<()> {
-    while !ctx.stop.load(std::sync::atomic::Ordering::Relaxed) {
-        if ctx.is_bsp {
-            ctx.serial
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .poll_stdin()?;
-        }
+    let _registration = ctx.kick.register();
 
+    while !ctx.stop.load(std::sync::atomic::Ordering::Relaxed) {
         let exit = match vcpu.run() {
             Ok(exit) => exit,
-            // EINTR: kick timer. EAGAIN: AP not yet runnable (Wait-For-SIPI).
+            // EINTR: on-demand kick (stop). EAGAIN: AP not yet runnable (Wait-For-SIPI).
             Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {
                 if e.errno() == libc::EAGAIN {
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -313,7 +333,7 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 continue;
             }
             Err(e) => {
-                ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                request_stop(&ctx);
                 return Err(crate::error::Error::KvmIoctl(e));
             }
         };
@@ -321,7 +341,7 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
         match exit {
             kvm_ioctls::VcpuExit::IoOut(port, data) => {
                 if ctx.exit_on_hlt && port == DEBUG_EXIT_IOPORT {
-                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    request_stop(&ctx);
                     let code = data.first().copied().unwrap_or(0);
                     if code != 0 {
                         return Err(crate::error::Error::UnexpectedExit(format!(
@@ -376,22 +396,24 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
             }
             kvm_ioctls::VcpuExit::Hlt => {
                 if ctx.exit_on_hlt {
-                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    request_stop(&ctx);
                     break;
                 }
+
+                // Fallback when KVM_CAP_X86_DISABLE_EXITS is unavailable.
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             kvm_ioctls::VcpuExit::Shutdown => {
-                ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                request_stop(&ctx);
                 break;
             }
             kvm_ioctls::VcpuExit::SystemEvent(event_type, _) => match event_type {
                 kvm_bindings::KVM_SYSTEM_EVENT_SHUTDOWN | kvm_bindings::KVM_SYSTEM_EVENT_RESET => {
-                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    request_stop(&ctx);
                     break;
                 }
                 other => {
-                    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    request_stop(&ctx);
                     return Err(crate::error::Error::UnexpectedExit(format!(
                         "vcpu{} system event {other}",
                         ctx.id
@@ -399,7 +421,7 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 }
             },
             other => {
-                ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                request_stop(&ctx);
                 return Err(crate::error::Error::UnexpectedExit(format!(
                     "vcpu{} {other:?}",
                     ctx.id
@@ -410,55 +432,95 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
     Ok(())
 }
 
-/// Arms ITIMER_REAL so blocking `KVM_RUN` returns `EINTR` periodically.
-struct KvmRunKickTimer;
+fn request_stop(ctx: &VcpuRunCtx) {
+    ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    ctx.kick.kick_all();
+}
 
-impl KvmRunKickTimer {
-    fn arm(period_ms: u64) -> crate::error::Result<Self> {
-        // SAFETY: no-op handler without SA_RESTART so KVM_RUN returns EINTR.
+/// Tracks live vCPU threads so stop can interrupt blocking `KVM_RUN`.
+struct VcpuKickRegistry {
+    threads: std::sync::Mutex<Vec<libc::pthread_t>>,
+}
+
+impl VcpuKickRegistry {
+    fn new() -> Self {
+        Self {
+            threads: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register(self: &std::sync::Arc<Self>) -> VcpuKickRegistration {
+        // SAFETY: pthread_self is always valid for the calling thread.
+        let tid = unsafe { libc::pthread_self() };
+        self.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tid);
+        VcpuKickRegistration {
+            registry: std::sync::Arc::clone(self),
+            tid,
+        }
+    }
+
+    fn kick_all(&self) {
+        let threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+        for &tid in threads.iter() {
+            // SAFETY: tid was recorded from a live vCPU thread; SIGUSR2 has a no-op handler.
+            unsafe {
+                let _ = libc::pthread_kill(tid, VCPU_KICK_SIGNUM);
+            }
+        }
+    }
+}
+
+struct VcpuKickRegistration {
+    registry: std::sync::Arc<VcpuKickRegistry>,
+    tid: libc::pthread_t,
+}
+
+impl Drop for VcpuKickRegistration {
+    fn drop(&mut self) {
+        let mut threads = self
+            .registry
+            .threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        threads.retain(|&t| t != self.tid);
+    }
+}
+
+/// Installs a temporary SIGUSR2 handler for the duration of [`Vmm::run`].
+struct VcpuKickHandlerGuard {
+    prev: libc::sigaction,
+}
+
+impl VcpuKickHandlerGuard {
+    fn install() -> crate::error::Result<Self> {
+        // SAFETY: no-op handler without SA_RESTART so KVM_RUN returns EINTR on kick.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = noop_sigalrm as *const () as usize;
+            sa.sa_sigaction = noop_vcpu_kick as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0;
-            if libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut()) != 0 {
+            let mut prev: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(VCPU_KICK_SIGNUM, &sa, &mut prev) != 0 {
                 return Err(crate::error::Error::Serial(format!(
-                    "sigaction SIGALRM: {}",
+                    "sigaction SIGUSR2: {}",
                     std::io::Error::last_os_error()
                 )));
             }
-
-            debug_assert!(period_ms < 1000);
-            let usec = (period_ms * 1000) as libc::suseconds_t;
-            let it = libc::itimerval {
-                it_interval: libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: usec,
-                },
-                it_value: libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: usec,
-                },
-            };
-            if libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) != 0 {
-                return Err(crate::error::Error::Serial(format!(
-                    "setitimer: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            Ok(Self { prev })
         }
-        Ok(Self)
     }
 }
 
-impl Drop for KvmRunKickTimer {
+impl Drop for VcpuKickHandlerGuard {
     fn drop(&mut self) {
-        // SAFETY: disarm the process-wide interval timer we armed.
+        // SAFETY: restore the previous disposition installed before run().
         unsafe {
-            let it: libc::itimerval = std::mem::zeroed();
-            let _ = libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut());
+            let _ = libc::sigaction(VCPU_KICK_SIGNUM, &self.prev, std::ptr::null_mut());
         }
     }
 }
 
-extern "C" fn noop_sigalrm(_: libc::c_int) {}
+extern "C" fn noop_vcpu_kick(_: libc::c_int) {}
