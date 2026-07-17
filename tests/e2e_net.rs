@@ -1,4 +1,4 @@
-//! End-to-end virtio-net (TAP: ping, TCP, bulk, offloads, SMP).
+//! End-to-end virtio-net.
 
 #[path = "support/guest.rs"]
 mod guest;

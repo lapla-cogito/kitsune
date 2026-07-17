@@ -1,4 +1,4 @@
-//! End-to-end Linux boot over serial (requires prepared guest artifacts).
+//! End-to-end Linux boot over serial .
 
 #[path = "support/guest.rs"]
 mod guest;

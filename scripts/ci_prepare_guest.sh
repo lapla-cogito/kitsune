@@ -59,5 +59,12 @@ if [[ ! -f "$OUT/disk.ext4" ]]; then
   fi
 fi
 
+# Read-only copy for virtio-blk RO e2e (host open falls back to O_RDONLY).
+if [[ ! -f "$OUT/disk-ro.ext4" || "$OUT/disk.ext4" -nt "$OUT/disk-ro.ext4" ]]; then
+  echo "building read-only disk image..."
+  cp -f "$OUT/disk.ext4" "$OUT/disk-ro.ext4"
+  chmod a-w "$OUT/disk-ro.ext4"
+fi
+
 echo "guest artifacts ready in $OUT"
 ls -lh "$OUT"
