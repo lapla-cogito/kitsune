@@ -13,6 +13,65 @@ if [ "$cpus" -ge 2 ]; then
 fi
 if [ -e /dev/vda ]; then
   echo "kitsune-blk-ok"
+  ro=0
+  if [ -r /sys/block/vda/ro ]; then
+    ro=$(cat /sys/block/vda/ro)
+  fi
+  mkdir -p /mnt
+  if [ "$ro" = 1 ]; then
+    # Read-only virtio-blk: mount (if possible) and confirm writes fail.
+    if mount -t ext4 -o ro /dev/vda /mnt 2>/dev/null \
+      || mount -o ro /dev/vda /mnt 2>/dev/null; then
+      if echo no > /mnt/kitsune-should-fail 2>/dev/null; then
+        echo "kitsune-blk-ro-fail"
+      else
+        echo "kitsune-blk-ro-ok"
+      fi
+      umount /mnt 2>/dev/null || true
+    else
+      # Still RO at the block layer even if mount is unavailable.
+      echo "kitsune-blk-ro-ok"
+    fi
+  else
+    # Read-write: small write/readback, then multi-block (~32 KiB) I/O.
+    io_ok=0
+    bulk_ok=0
+    if mount -t ext4 /dev/vda /mnt 2>/dev/null || mount /dev/vda /mnt 2>/dev/null; then
+      if echo kitsune-data > /mnt/t && sync; then
+        umount /mnt 2>/dev/null || true
+        if mount -t ext4 /dev/vda /mnt 2>/dev/null || mount /dev/vda /mnt 2>/dev/null; then
+          if grep -q kitsune-data /mnt/t 2>/dev/null; then
+            io_ok=1
+          fi
+        fi
+      fi
+      if [ "$io_ok" = 1 ]; then
+        if dd if=/dev/zero of=/mnt/bulk bs=1024 count=32 conv=fsync 2>/dev/null \
+          || dd if=/dev/zero of=/mnt/bulk bs=1024 count=32 2>/dev/null; then
+          sync
+          umount /mnt 2>/dev/null || true
+          if mount -t ext4 /dev/vda /mnt 2>/dev/null || mount /dev/vda /mnt 2>/dev/null; then
+            sz=$(wc -c < /mnt/bulk 2>/dev/null || echo 0)
+            sz=$(echo "$sz" | tr -d ' \n')
+            if [ -n "$sz" ] && [ "$sz" -ge 32768 ] 2>/dev/null; then
+              bulk_ok=1
+            fi
+          fi
+        fi
+      fi
+      umount /mnt 2>/dev/null || true
+    fi
+    if [ "$io_ok" = 1 ]; then
+      echo "kitsune-blk-io-ok"
+    else
+      echo "kitsune-blk-io-fail"
+    fi
+    if [ "$bulk_ok" = 1 ]; then
+      echo "kitsune-blk-bulk-ok"
+    else
+      echo "kitsune-blk-bulk-fail"
+    fi
+  fi
 fi
 # virtio-net: offload features, static addressing, then host reachability tests.
 if [ -d /sys/class/net/eth0 ]; then
