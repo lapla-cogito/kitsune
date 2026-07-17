@@ -1,3 +1,5 @@
+//! COM1 (16550) serial console bridged to host stdin/stdout.
+
 /// COM1 base port.
 pub const SERIAL_PORT_BASE: u16 = 0x3f8;
 /// Number of I/O ports used by the 16550 UART.
@@ -38,10 +40,21 @@ struct HostStdioState {
     termios: Option<libc::termios>,
 }
 
+/// Result of one [`SerialConsole::drain_stdin`] pass for the stdin worker.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainStatus {
+    /// Host stdin is still open for reading.
+    pub stdin_open: bool,
+    /// UART RX FIFO has room for more host bytes.
+    pub fifo_has_space: bool,
+}
+
 /// 16550-compatible serial console bridged to the host stdin/stdout.
 pub struct SerialConsole {
     inner: vm_superio::Serial<IrqfdTrigger, vm_superio::serial::NoEvents, std::io::Stdout>,
     irq_fd: std::sync::Arc<vmm_sys_util::eventfd::EventFd>,
+    /// Wakes the stdin worker when RX FIFO has space after being full.
+    rx_space_fd: vmm_sys_util::eventfd::EventFd,
     stdin_ready: bool,
     host: HostStdioState,
     dsr_probe: DsrProbe,
@@ -65,6 +78,9 @@ impl SerialConsole {
         vm.register_irqfd(irq_fd.as_ref(), SERIAL_IRQ)
             .map_err(crate::error::Error::KvmIoctl)?;
 
+        let rx_space_fd = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| crate::error::Error::Serial(format!("serial rx space eventfd: {e}")))?;
+
         Ok(Self {
             inner: vm_superio::Serial::new(
                 IrqfdTrigger {
@@ -73,12 +89,20 @@ impl SerialConsole {
                 std::io::stdout(),
             ),
             irq_fd,
+            rx_space_fd,
             stdin_ready,
             host,
             dsr_probe: DsrProbe::Idle,
             pending_rx: Vec::new(),
             dsr_auto_reply,
         })
+    }
+
+    /// Clone of the RX-space eventfd for the stdin worker.
+    pub fn rx_space_fd(&self) -> crate::error::Result<vmm_sys_util::eventfd::EventFd> {
+        self.rx_space_fd
+            .try_clone()
+            .map_err(|e| crate::error::Error::Serial(e.to_string()))
     }
 
     /// Handle a guest write to a port in the COM1 range.
@@ -123,6 +147,7 @@ impl SerialConsole {
                     self.pending_rx.extend_from_slice(b"\x1b[1;80R");
                     self.flush_pending_rx()?;
                     self.reassert_rx_irq()?;
+                    self.notify_rx_space();
                 }
                 DsrProbe::Idle
             }
@@ -164,21 +189,34 @@ impl SerialConsole {
         Ok(())
     }
 
+    fn notify_rx_space(&self) {
+        if self.inner.fifo_capacity() > 0 {
+            let _ = self.rx_space_fd.write(1);
+        }
+    }
+
     /// Handle a guest read from a port in the COM1 range.
     pub fn bus_read(&mut self, port: u16, data: &mut [u8]) {
         let offset = (port - SERIAL_PORT_BASE) as u8;
         for byte in data.iter_mut() {
             *byte = self.inner.read(offset);
         }
+        // Guest drain of RBR frees RX FIFO space for the host stdin worker.
+        if offset == 0 {
+            self.notify_rx_space();
+        }
     }
 
-    /// Pull host stdin into the UART RX FIFO; inject pending ANSI replies.
-    pub fn poll_stdin(&mut self) -> crate::error::Result<()> {
+    /// Pull available host stdin bytes into the UART RX FIFO.
+    pub fn drain_stdin(&mut self) -> crate::error::Result<DrainStatus> {
         self.flush_pending_rx()?;
         self.reassert_rx_irq()?;
 
         if !self.stdin_ready {
-            return Ok(());
+            return Ok(DrainStatus {
+                stdin_open: false,
+                fifo_has_space: self.inner.fifo_capacity() > 0,
+            });
         }
 
         let mut buf = [0u8; 64];
@@ -214,12 +252,186 @@ impl SerialConsole {
                 return Err(crate::error::Error::Serial(err.to_string()));
             }
         }
-        Ok(())
+
+        Ok(DrainStatus {
+            stdin_open: self.stdin_ready,
+            fifo_has_space: self.inner.fifo_capacity() > 0,
+        })
+    }
+
+    pub fn stdin_ready(&self) -> bool {
+        self.stdin_ready
     }
 
     pub fn handles_port(port: u16) -> bool {
         (SERIAL_PORT_BASE..SERIAL_PORT_BASE + SERIAL_PORT_SIZE).contains(&port)
     }
+}
+
+/// Background thread that blocks in `poll` on stdin and feeds [`SerialConsole`].
+pub struct StdinWorker {
+    stop_fd: vmm_sys_util::eventfd::EventFd,
+    handle: Option<std::thread::JoinHandle<crate::error::Result<()>>>,
+}
+
+impl StdinWorker {
+    /// Spawn the worker. `serial` is shared with the vCPU I/O path.
+    pub fn start(
+        serial: std::sync::Arc<std::sync::Mutex<SerialConsole>>,
+    ) -> crate::error::Result<Self> {
+        let stop_fd = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| crate::error::Error::Serial(e.to_string()))?;
+        let stop_fd_worker = stop_fd
+            .try_clone()
+            .map_err(|e| crate::error::Error::Serial(e.to_string()))?;
+        let space_fd = serial
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rx_space_fd()?;
+
+        let handle = std::thread::Builder::new()
+            .name("serial-stdin".into())
+            .spawn(move || stdin_worker_loop(serial, stop_fd_worker, space_fd))
+            .map_err(|e| crate::error::Error::Serial(e.to_string()))?;
+
+        Ok(Self {
+            stop_fd,
+            handle: Some(handle),
+        })
+    }
+
+    /// Wake the worker and wait for it to exit.
+    pub fn stop(mut self) -> crate::error::Result<()> {
+        let _ = self.stop_fd.write(1);
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(crate::error::Error::Serial(
+                "serial stdin worker panicked".into(),
+            )),
+        }
+    }
+}
+
+impl Drop for StdinWorker {
+    fn drop(&mut self) {
+        let _ = self.stop_fd.write(1);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn stdin_worker_loop(
+    serial: std::sync::Arc<std::sync::Mutex<SerialConsole>>,
+    stop_fd: vmm_sys_util::eventfd::EventFd,
+    space_fd: vmm_sys_util::eventfd::EventFd,
+) -> crate::error::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let stop_raw = stop_fd.as_raw_fd();
+    let space_raw = space_fd.as_raw_fd();
+    let mut watch_stdin = serial
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stdin_ready();
+    // When the UART RX FIFO is full, do not poll stdin (level-triggered would spin).
+    let mut wait_for_space = false;
+
+    loop {
+        // fds[0]=stop, fds[1]=stdin or space, depending on wait_for_space.
+        let mut fds = [
+            libc::pollfd {
+                fd: stop_raw,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: -1,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut nfds = 1usize;
+        if wait_for_space {
+            fds[1].fd = space_raw;
+            nfds = 2;
+        } else if watch_stdin {
+            fds[1].fd = libc::STDIN_FILENO;
+            nfds = 2;
+        }
+
+        // SAFETY: poll on valid fds owned for the worker lifetime.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(crate::error::Error::Serial(format!("stdin poll: {err}")));
+        }
+
+        if fds[0].revents != 0 {
+            let _ = stop_fd.read();
+            break;
+        }
+
+        if nfds < 2 || fds[1].revents == 0 {
+            continue;
+        }
+
+        let rev = fds[1].revents;
+        if wait_for_space {
+            // RX FIFO may have space; clear and try draining stdin again.
+            if rev & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(crate::error::Error::Serial(
+                    "serial rx space eventfd error".into(),
+                ));
+            }
+            let _ = space_fd.read();
+            wait_for_space = false;
+            let status = {
+                let mut guard = serial.lock().unwrap_or_else(|e| e.into_inner());
+                guard.drain_stdin()?
+            };
+            watch_stdin = status.stdin_open;
+            if watch_stdin && !status.fifo_has_space {
+                wait_for_space = true;
+                let _ = space_fd.read(); // clear stale signals before waiting
+            }
+            continue;
+        }
+
+        // Watching stdin.
+        if rev & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            watch_stdin = false;
+            continue;
+        }
+        // POLLHUP without POLLIN: peer closed; treat as EOF.
+        if rev & libc::POLLHUP != 0 && rev & libc::POLLIN == 0 {
+            let mut guard = serial.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.drain_stdin()?;
+            watch_stdin = false;
+            continue;
+        }
+        if rev & libc::POLLIN == 0 {
+            continue;
+        }
+
+        let status = {
+            let mut guard = serial.lock().unwrap_or_else(|e| e.into_inner());
+            guard.drain_stdin()?
+        };
+        watch_stdin = status.stdin_open;
+        if watch_stdin && !status.fifo_has_space {
+            wait_for_space = true;
+            let _ = space_fd.read();
+        }
+    }
+    Ok(())
 }
 
 fn prepare_host_stdio() -> crate::error::Result<HostStdioState> {

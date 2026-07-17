@@ -7,5 +7,6 @@ mod virtio_net;
 
 pub(crate) use serial::SERIAL_IRQ;
 pub(crate) use serial::SerialConsole;
+pub(crate) use serial::StdinWorker;
 pub use virtio_blk::VirtioBlock;
 pub use virtio_net::VirtioNet;
