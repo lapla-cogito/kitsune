@@ -23,6 +23,8 @@ pub struct Vmm {
     num_vcpus: u8,
     /// When true, `VcpuExit::Hlt` ends `run()`.
     exit_on_hlt: bool,
+    /// When true, HLT/PAUSE/MWAIT are handled in-kernel (no userspace exit).
+    idle_exits_disabled: bool,
 }
 
 impl Vmm {
@@ -82,21 +84,39 @@ impl Vmm {
             net: None,
             num_vcpus: config.num_vcpus,
             exit_on_hlt: true,
+            idle_exits_disabled: false,
         })
     }
 
-    /// Prefer in-kernel HLT handling so idle guests do not tight-loop in userspace.
-    fn try_disable_hlt_exits(vm: &kvm_ioctls::VmFd) -> bool {
+    /// Prefer in-kernel idle instructions so guests do not exit to userspace on HLT/PAUSE/MWAIT.
+    /// Tries the richest flag set first, then falls back.
+    ///
+    /// Flat-binary mode must keep HLT exits (`exit_on_hlt`); only call this for direct kernel boot.
+    fn try_disable_idle_exits(vm: &kvm_ioctls::VmFd) -> bool {
         let cap_id = kvm_bindings::KVM_CAP_X86_DISABLE_EXITS as i32;
         if vm.check_extension_raw(cap_id as libc::c_ulong) <= 0 {
             return false;
         }
-        let mut cap = kvm_bindings::kvm_enable_cap {
-            cap: kvm_bindings::KVM_CAP_X86_DISABLE_EXITS,
-            ..Default::default()
-        };
-        cap.args[0] = u64::from(kvm_bindings::KVM_X86_DISABLE_EXITS_HLT);
-        vm.enable_cap(&cap).is_ok()
+
+        let attempts = [
+            kvm_bindings::KVM_X86_DISABLE_EXITS_HLT
+                | kvm_bindings::KVM_X86_DISABLE_EXITS_PAUSE
+                | kvm_bindings::KVM_X86_DISABLE_EXITS_MWAIT,
+            kvm_bindings::KVM_X86_DISABLE_EXITS_HLT | kvm_bindings::KVM_X86_DISABLE_EXITS_PAUSE,
+            kvm_bindings::KVM_X86_DISABLE_EXITS_HLT,
+        ];
+
+        for flags in attempts {
+            let mut cap = kvm_bindings::kvm_enable_cap {
+                cap: kvm_bindings::KVM_CAP_X86_DISABLE_EXITS,
+                ..Default::default()
+            };
+            cap.args[0] = u64::from(flags);
+            if vm.enable_cap(&cap).is_ok() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Attach a virtio-blk device backed by the given host path.
@@ -147,6 +167,7 @@ impl Vmm {
 
         crate::vcpu::setup_real_mode(&self.vcpus[0], entry)?;
         self.exit_on_hlt = true;
+        self.idle_exits_disabled = false;
         Ok(())
     }
 
@@ -187,8 +208,7 @@ impl Vmm {
             ap.set_mp_state(mp).map_err(crate::error::Error::KvmIoctl)?;
         }
 
-        // Idle Linux guests HLT frequently. Handle HLT in-kernel when possible.
-        let _ = Self::try_disable_hlt_exits(&self.vm);
+        self.idle_exits_disabled = Self::try_disable_idle_exits(&self.vm);
         self.exit_on_hlt = false;
         Ok(())
     }
@@ -216,6 +236,7 @@ impl Vmm {
             net.start_worker(mem.clone())?;
         }
         let exit_on_hlt = self.exit_on_hlt;
+        let idle_exits_disabled = self.idle_exits_disabled;
 
         let mut vcpus = std::mem::take(&mut self.vcpus);
         let bsp = vcpus.remove(0);
@@ -226,6 +247,7 @@ impl Vmm {
             let ctx = VcpuRunCtx {
                 id,
                 exit_on_hlt: false,
+                idle_exits_disabled,
                 stop: std::sync::Arc::clone(&stop),
                 kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
@@ -246,6 +268,7 @@ impl Vmm {
             VcpuRunCtx {
                 id: 0,
                 exit_on_hlt,
+                idle_exits_disabled,
                 stop: std::sync::Arc::clone(&stop),
                 kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
@@ -311,6 +334,7 @@ impl Vmm {
 struct VcpuRunCtx {
     id: u8,
     exit_on_hlt: bool,
+    idle_exits_disabled: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     kick: std::sync::Arc<VcpuKickRegistry>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
@@ -399,9 +423,10 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                     request_stop(&ctx);
                     break;
                 }
-
-                // Fallback when KVM_CAP_X86_DISABLE_EXITS is unavailable.
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                if ctx.idle_exits_disabled {
+                    continue;
+                }
+                idle_wait(&ctx);
             }
             kvm_ioctls::VcpuExit::Shutdown => {
                 request_stop(&ctx);
@@ -435,6 +460,18 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
 fn request_stop(ctx: &VcpuRunCtx) {
     ctx.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     ctx.kick.kick_all();
+}
+
+/// Interruptible idle when userspace still sees HLT exits.
+fn idle_wait(ctx: &VcpuRunCtx) {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+    const SLICES: u32 = 10; // ~10 ms total before re-entering KVM_RUN
+    for _ in 0..SLICES {
+        if ctx.stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(SLICE);
+    }
 }
 
 /// Tracks live vCPU threads so stop can interrupt blocking `KVM_RUN`.
