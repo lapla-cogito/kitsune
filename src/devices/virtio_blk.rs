@@ -1,4 +1,4 @@
-//! Virtio-mmio block device (virtio 1.0 modern transport).
+//! Virtio-mmio block device.
 
 use std::io::Read as _;
 use std::io::Write as _;
@@ -8,7 +8,9 @@ use std::os::unix::ffi::OsStrExt as _;
 use virtio_queue::QueueT as _;
 
 /// MMIO base used for the first (and only) virtio-blk device.
-pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
+///
+/// Kept at `crate::memory::GUEST_RAM_END` so guest RAM never overlaps this window.
+pub const VIRTIO_MMIO_BASE: u64 = crate::memory::GUEST_RAM_END;
 /// GSI / IRQ line advertised to the guest for this device.
 pub const VIRTIO_BLK_IRQ: u32 = 5;
 

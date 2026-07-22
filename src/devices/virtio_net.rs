@@ -1,4 +1,4 @@
-//! Virtio-mmio network device (virtio 1.0 modern) backed by a host TAP.
+//! Virtio-mmio network device backed by a host TAP.
 
 use std::io::Read as _;
 use std::io::Write as _;
@@ -8,7 +8,7 @@ use std::os::fd::IntoRawFd as _;
 use virtio_queue::QueueT as _;
 
 /// MMIO base for the virtio-net device (after virtio-blk window).
-pub const VIRTIO_NET_MMIO_BASE: u64 = 0xd000_1000;
+pub const VIRTIO_NET_MMIO_BASE: u64 = crate::memory::GUEST_RAM_END + 0x1000;
 /// GSI / IRQ line for virtio-net.
 pub const VIRTIO_NET_IRQ: u32 = 6;
 

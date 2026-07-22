@@ -1,4 +1,4 @@
-//! Virtio-mmio modern (version 2) transport shared by block and net devices.
+//! Virtio-mmio transport.
 
 use virtio_queue::QueueT as _;
 

@@ -1,4 +1,3 @@
-/// Error type for kitsune operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to open /dev/kvm: {0}")]
@@ -12,6 +11,16 @@ pub enum Error {
 
     #[error("invalid guest memory size {0} (must be a non-zero multiple of 4096)")]
     InvalidMemorySize(usize),
+
+    #[error(
+        "guest memory size {size} bytes exceeds maximum {max} bytes \
+         (must not overlap MMIO starting at {mmio_base:#x})"
+    )]
+    MemoryOverlapsMmio {
+        size: usize,
+        max: usize,
+        mmio_base: u64,
+    },
 
     #[error("invalid vCPU count {0} (must be 1..={1})")]
     InvalidVcpuCount(u8, u8),
@@ -59,5 +68,4 @@ pub enum Error {
     UnexpectedExit(String),
 }
 
-/// Result alias for kitsune.
 pub type Result<T> = std::result::Result<T, Error>;

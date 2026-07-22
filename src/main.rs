@@ -34,7 +34,11 @@ enum Command {
         flat_binary: Option<std::path::PathBuf>,
 
         /// Guest memory size in MiB
-        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
+        #[arg(
+            long,
+            default_value_t = 256,
+            value_parser = clap::value_parser!(u32).range(1..=kitsune::MAX_MEMORY_MIB as i64)
+        )]
         memory: u32,
 
         /// Number of guest vCPUs

@@ -161,7 +161,7 @@ kitsune run --flat-binary <path> [--load-addr N] [--entry N]
 | `--block` | Raw disk as virtio-blk (`/dev/vda`) | - |
 | `--tap` | Host TAP interface for virtio-net (e.g. `tap0`) | - |
 | `--cmdline` | Kernel command line | `console=ttyS0 reboot=k panic=1 pci=off nomodule` |
-| `--memory` | Guest RAM in MiB (kernel boot needs >= 32) | `256` |
+| `--memory` | Guest RAM in MiB (kernel boot needs >= 32. Max 3328 so RAM ends at or before virtio-mmio at `0xd0000000`) | `256` |
 | `--cpus` | Number of guest vCPUs (1–32; flat binary requires 1) | `1` |
 | `--flat-binary` | Real-mode flat binary (mutually exclusive with `--kernel`) | - |
 | `--load-addr` / `--entry` | Flat-binary GPA / entry (`CS.base = 0`) | `0` |

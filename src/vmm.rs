@@ -30,9 +30,6 @@ pub struct Vmm {
 impl Vmm {
     /// Create a VM with guest memory, IRQ chip, PIT, and `config.num_vcpus` vCPUs.
     pub fn new(config: &crate::config::VmmConfig) -> crate::error::Result<Self> {
-        if config.mem_size == 0 || !config.mem_size.is_multiple_of(4096) {
-            return Err(crate::error::Error::InvalidMemorySize(config.mem_size));
-        }
         if config.num_vcpus == 0 || config.num_vcpus > crate::config::MAX_VCPUS {
             return Err(crate::error::Error::InvalidVcpuCount(
                 config.num_vcpus,
