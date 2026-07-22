@@ -18,6 +18,7 @@ pub struct Vmm {
     vm: kvm_ioctls::VmFd,
     vcpus: Vec<kvm_ioctls::VcpuFd>,
     serial: Option<crate::devices::SerialConsole>,
+    legacy_io: crate::devices::LegacyIo,
     block: Option<crate::devices::VirtioBlock>,
     net: Option<crate::devices::VirtioNet>,
     num_vcpus: u8,
@@ -77,6 +78,7 @@ impl Vmm {
             vm,
             vcpus,
             serial: Some(serial),
+            legacy_io: crate::devices::LegacyIo::new(),
             block: None,
             net: None,
             num_vcpus: config.num_vcpus,
@@ -223,6 +225,9 @@ impl Vmm {
         ));
         let stdin_worker = crate::devices::StdinWorker::start(std::sync::Arc::clone(&serial))?;
 
+        let legacy_io =
+            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.legacy_io)));
+
         let block = self.block.take().map(std::sync::Arc::new);
         if let Some(block) = block.as_ref() {
             block.start_worker(self.guest_mem.clone())?;
@@ -248,6 +253,7 @@ impl Vmm {
                 stop: std::sync::Arc::clone(&stop),
                 kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
+                legacy_io: std::sync::Arc::clone(&legacy_io),
                 block: block.clone(),
                 net: net.clone(),
                 mem: mem.clone(),
@@ -269,6 +275,7 @@ impl Vmm {
                 stop: std::sync::Arc::clone(&stop),
                 kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
+                legacy_io: std::sync::Arc::clone(&legacy_io),
                 block: block.clone(),
                 net: net.clone(),
                 mem,
@@ -318,6 +325,9 @@ impl Vmm {
         if let Ok(s) = std::sync::Arc::try_unwrap(serial) {
             self.serial = Some(s.into_inner().unwrap_or_else(|e| e.into_inner()));
         }
+        if let Ok(io) = std::sync::Arc::try_unwrap(legacy_io) {
+            self.legacy_io = io.into_inner().unwrap_or_else(|e| e.into_inner());
+        }
         self.block = block.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
         self.net = net.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
 
@@ -335,6 +345,7 @@ struct VcpuRunCtx {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     kick: std::sync::Arc<VcpuKickRegistry>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
+    legacy_io: std::sync::Arc<std::sync::Mutex<crate::devices::LegacyIo>>,
     block: Option<std::sync::Arc<crate::devices::VirtioBlock>>,
     net: Option<std::sync::Arc<crate::devices::VirtioNet>>,
     mem: vm_memory::GuestMemoryMmap<()>,
@@ -377,11 +388,26 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .bus_write(port, data)?;
+                } else if crate::devices::LegacyIo::handles_port(port) {
+                    let action = ctx
+                        .legacy_io
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .bus_write(port, data);
+                    if action == crate::devices::PowerAction::Reset {
+                        request_stop(&ctx);
+                        break;
+                    }
                 }
             }
             kvm_ioctls::VcpuExit::IoIn(port, data) => {
                 if crate::devices::SerialConsole::handles_port(port) {
                     ctx.serial
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .bus_read(port, data);
+                } else if crate::devices::LegacyIo::handles_port(port) {
+                    ctx.legacy_io
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .bus_read(port, data);
