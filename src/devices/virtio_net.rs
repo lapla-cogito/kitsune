@@ -66,6 +66,12 @@ const TUN_OFFLOADS: libc::c_uint = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_
 
 const CONFIG_SIZE: usize = 8; // mac[6] + status[2]
 
+/// TX descriptor held until TAP accepts the full frame (backpressure).
+struct PendingTx {
+    head: u16,
+    len: usize,
+}
+
 /// Mutable device state shared between MMIO handlers and the net worker.
 struct NetState {
     mmio: super::virtio_mmio::VirtioMmio,
@@ -73,6 +79,10 @@ struct NetState {
     mac: [u8; 6],
     rx_scratch: Vec<u8>,
     tx_scratch: Vec<u8>,
+    /// Guest TX frame in `tx_scratch` waiting for TAP write space.
+    pending_tx: Option<PendingTx>,
+    /// Host RX frame length in `rx_scratch` waiting for a guest RX buffer.
+    pending_rx_len: Option<usize>,
 }
 
 /// Virtio-mmio network device using a host TAP interface.
@@ -122,6 +132,8 @@ impl VirtioNet {
                 mac,
                 rx_scratch: vec![0u8; MAX_FRAME],
                 tx_scratch: Vec::with_capacity(MAX_FRAME),
+                pending_tx: None,
+                pending_rx_len: None,
             })),
             kick,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -227,10 +239,31 @@ fn worker_loop(
     let kick_fd = kick.as_raw_fd();
 
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let (want_tap_in, want_tap_out) = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            // Hold off TAP reads while an RX frame waits for guest buffers.
+            let want_in = s.pending_rx_len.is_none();
+            // Only wait for writable TAP when we can actually complete TX.
+            let tx_ready = s
+                .mmio
+                .queue(QUEUE_TX)
+                .is_some_and(virtio_queue::QueueT::ready);
+            let want_out = s.pending_tx.is_some() && tx_ready;
+            (want_in, want_out)
+        };
+
+        let mut tap_events = 0;
+        if want_tap_in {
+            tap_events |= libc::POLLIN;
+        }
+        if want_tap_out {
+            tap_events |= libc::POLLOUT;
+        }
+
         let mut fds = [
             libc::pollfd {
-                fd: tap_fd,
-                events: libc::POLLIN,
+                fd: if tap_events != 0 { tap_fd } else { -1 },
+                events: tap_events,
                 revents: 0,
             },
             libc::pollfd {
@@ -254,8 +287,7 @@ fn worker_loop(
             // Clear kick; coalesced notifies are fine.
             let _ = kick.read();
         }
-        let tap_ready = fds[0].revents != 0;
-        // Process when the guest notified, TAP has data, or either revent fired.
+        let tap_ready = fds[0].fd >= 0 && fds[0].revents != 0;
         if !kick_ready && !tap_ready {
             continue;
         }
@@ -273,30 +305,118 @@ fn process_net_once(
     mem: &vm_memory::GuestMemoryMmap<()>,
 ) -> crate::error::Result<()> {
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let mut need_irq = process_tx(&mut guard, mem)?;
-    need_irq |= poll_tap(&mut guard, mem)?;
+    let mut need_irq = false;
+    let mut first_err = None;
+
+    // Always raise used-queue IRQ if any descriptor was completed, even when a
+    // later step returns an error (otherwise the guest may miss add_used).
+    match process_tx(&mut guard, mem) {
+        Ok(used) => need_irq |= used,
+        Err((used, e)) => {
+            need_irq |= used;
+            first_err = Some(e);
+        }
+    }
+    match process_rx(&mut guard, mem) {
+        Ok(used) => need_irq |= used,
+        Err((used, e)) => {
+            need_irq |= used;
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+
     if need_irq {
         guard
             .mmio
             .signal_used_queue()
             .map_err(crate::error::Error::Net)?;
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
-fn process_tx(
+/// Result of attempting to send one frame to the TAP.
+#[derive(Debug, PartialEq, Eq)]
+enum TapSend {
+    Sent,
+    WouldBlock,
+}
+
+/// Write one full TAP frame. Does not drop on backpressure.
+fn tap_try_send(tap: &mut std::fs::File, packet: &[u8]) -> crate::error::Result<TapSend> {
+    loop {
+        match tap.write(packet) {
+            Ok(n) if n == packet.len() => return Ok(TapSend::Sent),
+            // TAP is datagram-like; a short write is not recoverable as a partial frame.
+            Ok(n) => {
+                return Err(crate::error::Error::Net(format!(
+                    "tap short write: {n}/{}",
+                    packet.len()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(TapSend::WouldBlock);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => return Err(crate::error::Error::Net(format!("tap write: {e}"))),
+        }
+    }
+}
+
+fn complete_tx(
     state: &mut NetState,
     mem: &vm_memory::GuestMemoryMmap<()>,
-) -> crate::error::Result<bool> {
+    head: u16,
+) -> crate::error::Result<()> {
+    state
+        .mmio
+        .queue_mut(QUEUE_TX)
+        .ok_or_else(|| crate::error::Error::Net("missing tx queue".into()))?
+        .add_used(mem, head, 0)
+        .map_err(|e| crate::error::Error::Net(e.to_string()))
+}
+
+/// TX/RX step result: `Ok(used)` or `Err((used, error))` so callers can signal
+/// the used ring even when a later hard error occurs.
+type StepResult = std::result::Result<bool, (bool, crate::error::Error)>;
+
+fn process_tx(state: &mut NetState, mem: &vm_memory::GuestMemoryMmap<()>) -> StepResult {
     let tx_ready = state
         .mmio
         .queue(QUEUE_TX)
         .is_some_and(virtio_queue::QueueT::ready);
     if !tx_ready {
+        // Drop held TX across reset / queue not-ready so head indices cannot
+        // leak into a re-initialized ring.
+        state.pending_tx = None;
         return Ok(false);
     }
 
     let mut used_any = false;
+
+    // Flush a frame held from a previous EAGAIN before taking more descriptors.
+    if let Some(pending) = state.pending_tx.take() {
+        let packet = &state.tx_scratch[..pending.len];
+        match tap_try_send(&mut state.tap, packet) {
+            Ok(TapSend::Sent) => {
+                complete_tx(state, mem, pending.head).map_err(|e| (used_any, e))?;
+                used_any = true;
+            }
+            Ok(TapSend::WouldBlock) => {
+                state.pending_tx = Some(pending);
+                return Ok(used_any);
+            }
+            Err(e) => {
+                let _ = complete_tx(state, mem, pending.head);
+                return Err((true, e));
+            }
+        }
+    }
+
     loop {
         let chain = {
             let Some(q) = state.mmio.queue_mut(QUEUE_TX) else {
@@ -308,107 +428,163 @@ fn process_tx(
             }
         };
         let head = chain.head_index();
-        let mut reader = virtio_queue::Reader::new(mem, chain)
-            .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-        let total = reader.available_bytes();
-        if total >= NET_HDR_LEN {
-            if state.tx_scratch.len() < total {
-                state.tx_scratch.resize(total, 0);
+        let mut reader = match virtio_queue::Reader::new(mem, chain) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = complete_tx(state, mem, head);
+                return Err((true, crate::error::Error::Net(e.to_string())));
             }
-            reader
-                .read_exact(&mut state.tx_scratch[..total])
-                .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-            // TAP with IFF_VNET_HDR expects virtio_net_hdr || eth frame in one write.
-            tap_write_packet(&mut state.tap, &state.tx_scratch[..total])?;
+        };
+        let total = reader.available_bytes();
+
+        // Malformed / empty: complete immediately (nothing to send).
+        if total < NET_HDR_LEN {
+            complete_tx(state, mem, head).map_err(|e| (used_any, e))?;
+            used_any = true;
+            continue;
         }
-        state
-            .mmio
-            .queue_mut(QUEUE_TX)
-            .ok_or_else(|| crate::error::Error::Net("missing tx queue".into()))?
-            .add_used(mem, head, 0)
-            .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-        used_any = true;
+
+        if state.tx_scratch.len() < total {
+            state.tx_scratch.resize(total, 0);
+        }
+        if let Err(e) = reader.read_exact(&mut state.tx_scratch[..total]) {
+            let _ = complete_tx(state, mem, head);
+            return Err((true, crate::error::Error::Net(e.to_string())));
+        }
+
+        match tap_try_send(&mut state.tap, &state.tx_scratch[..total]) {
+            Ok(TapSend::Sent) => {
+                complete_tx(state, mem, head).map_err(|e| (used_any, e))?;
+                used_any = true;
+            }
+            Ok(TapSend::WouldBlock) => {
+                state.pending_tx = Some(PendingTx { head, len: total });
+                break;
+            }
+            Err(e) => {
+                let _ = complete_tx(state, mem, head);
+                return Err((true, e));
+            }
+        }
     }
     Ok(used_any)
 }
 
-fn poll_tap(
-    state: &mut NetState,
-    mem: &vm_memory::GuestMemoryMmap<()>,
-) -> crate::error::Result<bool> {
+fn process_rx(state: &mut NetState, mem: &vm_memory::GuestMemoryMmap<()>) -> StepResult {
     let rx_ready = state
         .mmio
         .queue(QUEUE_RX)
         .is_some_and(virtio_queue::QueueT::ready);
     if !rx_ready {
+        // Drop held RX across reset / queue not-ready.
+        state.pending_rx_len = None;
         return Ok(false);
     }
 
     let mut used_any = false;
+
+    // Deliver a held frame before reading more from the TAP.
+    if state.pending_rx_len.is_some() {
+        used_any |= flush_pending_rx(state, mem).map_err(|e| (used_any, e))?;
+        if state.pending_rx_len.is_some() {
+            // Still blocked on guest RX buffers; do not read more.
+            return Ok(used_any);
+        }
+    }
+
     loop {
         match state.tap.read(&mut state.rx_scratch) {
             Ok(0) => break,
-            Ok(n) if n < NET_HDR_LEN => {}
+            Ok(n) if n < NET_HDR_LEN => {
+                // Undersized TAP read: discard (not a valid virtio-net frame).
+                continue;
+            }
             Ok(n) => {
-                if deliver_rx(state, mem, n)? {
-                    used_any = true;
+                state.pending_rx_len = Some(n);
+                used_any |= flush_pending_rx(state, mem).map_err(|e| (used_any, e))?;
+                if state.pending_rx_len.is_some() {
+                    break;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => return Err(crate::error::Error::Net(format!("tap read: {e}"))),
+            Err(e) => {
+                return Err((used_any, crate::error::Error::Net(format!("tap read: {e}"))));
+            }
         }
     }
     Ok(used_any)
 }
 
-fn deliver_rx(
+/// Try to place `pending_rx_len` into guest RX buffers.
+///
+/// Undersized guest chains are returned with used length 0 so the driver can
+/// recycle them. If the avail ring is exhausted without a large enough buffer,
+/// the pending frame is dropped so TAP `POLLIN` can resume.
+fn flush_pending_rx(
     state: &mut NetState,
     mem: &vm_memory::GuestMemoryMmap<()>,
-    n: usize,
 ) -> crate::error::Result<bool> {
-    let chain = {
-        let Some(q) = state.mmio.queue_mut(QUEUE_RX) else {
-            return Ok(false);
-        };
-        match q.pop_descriptor_chain(mem) {
-            Some(c) => c,
-            None => return Ok(false),
-        }
+    let Some(frame_len) = state.pending_rx_len else {
+        return Ok(false);
     };
-    let head = chain.head_index();
-    let mut writer = virtio_queue::Writer::new(mem, chain)
-        .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-    let frame = &state.rx_scratch[..n];
-    let used_len = if writer.available_bytes() < frame.len() {
-        0
-    } else {
+    let mut used_any = false;
+    let mut saw_chain = false;
+    let mut saw_fit = false;
+
+    loop {
+        let chain = {
+            let Some(q) = state.mmio.queue_mut(QUEUE_RX) else {
+                break;
+            };
+            match q.pop_descriptor_chain(mem) {
+                Some(c) => c,
+                None => break,
+            }
+        };
+        saw_chain = true;
+        let head = chain.head_index();
+        let mut writer = virtio_queue::Writer::new(mem, chain)
+            .map_err(|e| crate::error::Error::Net(e.to_string()))?;
+
+        if writer.available_bytes() < frame_len {
+            // Buffer too small: give it back empty and try the next chain.
+            state
+                .mmio
+                .queue_mut(QUEUE_RX)
+                .ok_or_else(|| crate::error::Error::Net("missing rx queue".into()))?
+                .add_used(mem, head, 0)
+                .map_err(|e| crate::error::Error::Net(e.to_string()))?;
+            used_any = true;
+            continue;
+        }
+
+        let frame = &state.rx_scratch[..frame_len];
         writer
             .write_all(frame)
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-        frame.len() as u32
-    };
-    state
-        .mmio
-        .queue_mut(QUEUE_RX)
-        .ok_or_else(|| crate::error::Error::Net("missing rx queue".into()))?
-        .add_used(mem, head, used_len)
-        .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-    Ok(true)
-}
-
-/// One TAP write is one packet; never use `write_all` (it can split packets).
-fn tap_write_packet(tap: &mut std::fs::File, packet: &[u8]) -> crate::error::Result<()> {
-    match tap.write(packet) {
-        Ok(n) if n == packet.len() => Ok(()),
-        Ok(n) => Err(crate::error::Error::Net(format!(
-            "tap short write: {n}/{}",
-            packet.len()
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EINTR) => tap_write_packet(tap, packet),
-        Err(e) => Err(crate::error::Error::Net(format!("tap write: {e}"))),
+        state
+            .mmio
+            .queue_mut(QUEUE_RX)
+            .ok_or_else(|| crate::error::Error::Net("missing rx queue".into()))?
+            .add_used(mem, head, frame_len as u32)
+            .map_err(|e| crate::error::Error::Net(e.to_string()))?;
+        state.pending_rx_len = None;
+        used_any = true;
+        saw_fit = true;
+        break;
     }
+
+    // Avail ring drained without a large enough buffer: drop the frame so the
+    // device can resume TAP reads (avoids permanent POLLIN starve).
+    if state.pending_rx_len.is_some() && saw_chain && !saw_fit {
+        eprintln!(
+            "kitsune: virtio-net: dropping {frame_len}-byte RX frame (no guest buffer large enough)"
+        );
+        state.pending_rx_len = None;
+    }
+
+    Ok(used_any)
 }
 
 /// Minimal `struct ifreq` layout for `TUNSETIFF` on Linux.
@@ -508,6 +684,10 @@ fn mac_from_name(ifname: &str) -> [u8; 6] {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+
     #[test]
     fn features_include_offloads_when_enabled() {
         let base = super::advertised_features(false);
@@ -532,5 +712,52 @@ mod tests {
     #[test]
     fn max_frame_fits_gso() {
         const { assert!(super::MAX_FRAME >= 65536 + super::NET_HDR_LEN) };
+    }
+
+    fn nonblock_pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 with valid stack array.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2 failed");
+        // SAFETY: exclusive ownership of the two fds.
+        let r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        (r, w)
+    }
+
+    #[test]
+    fn tap_try_send_would_block_does_not_claim_sent() {
+        let (mut reader, mut writer) = nonblock_pipe();
+        // Fill the pipe so the next write blocks.
+        let chunk = vec![0xabu8; 4096];
+        loop {
+            match writer.write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill pipe: {e}"),
+            }
+        }
+        let packet = vec![0xcd; 2048];
+        match super::tap_try_send(&mut writer, &packet) {
+            Ok(super::TapSend::WouldBlock) => {}
+            other => panic!("expected WouldBlock, got {other:?}"),
+        }
+        // Drain so Drop does not hang on some kernels.
+        let mut buf = [0u8; 4096];
+        while reader.read(&mut buf).unwrap_or(0) > 0 {}
+    }
+
+    #[test]
+    fn tap_try_send_full_packet() {
+        let (mut reader, mut writer) = nonblock_pipe();
+        let packet = b"virtio-net-frame\0\0\0\0";
+        assert_eq!(
+            super::tap_try_send(&mut writer, packet).unwrap(),
+            super::TapSend::Sent
+        );
+        let mut got = vec![0u8; packet.len()];
+        assert_eq!(reader.read(&mut got).unwrap(), packet.len());
+        assert_eq!(&got[..], packet);
     }
 }
