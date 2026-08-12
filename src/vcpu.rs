@@ -1,14 +1,23 @@
 //! vCPU register setup for real mode and 64-bit Linux boot.
 
 use vm_memory::Address as _;
+use vm_memory::GuestMemoryBackend as _;
 use vm_memory::bytes::Bytes as _;
 
 const BOOT_STACK_POINTER: u64 = crate::boot::BOOT_STACK_POINTER;
 const ZERO_PAGE_START: u64 = crate::boot::ZERO_PAGE_START;
 
 const PML4_START: u64 = 0x9000;
-const PDPTE_START: u64 = 0xa000;
-const PDE_START: u64 = 0xb000;
+const PDPT_START: u64 = 0xa000;
+/// First page-directory table.
+const PD_TABLES_START: u64 = 0xb000;
+
+const PAGE_SIZE: u64 = 0x1000;
+const HUGE_PAGE_2M: u64 = 0x20_0000;
+const PD_ENTRIES: u64 = 512;
+
+const PTE_PRESENT_WRITABLE: u64 = 0x03;
+const PTE_PRESENT_WRITABLE_PS: u64 = 0x83;
 
 const X86_CR0_PE: u64 = 0x1;
 const X86_CR0_PG: u64 = 0x8000_0000;
@@ -149,27 +158,79 @@ fn setup_sregs_long_mode(
     sregs.ss = data;
     sregs.tr = tss;
 
-    // Identity-map the first 1 GiB with 2 MiB pages.
-    let boot_pml4 = vm_memory::GuestAddress(PML4_START);
-    let boot_pdpte = vm_memory::GuestAddress(PDPTE_START);
-    let boot_pde = vm_memory::GuestAddress(PDE_START);
+    setup_identity_map(mem)?;
 
-    mem.write_obj(boot_pdpte.raw_value() | 0x03, boot_pml4)
-        .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
-    mem.write_obj(boot_pde.raw_value() | 0x03, boot_pdpte)
-        .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
-    for i in 0..512u64 {
-        mem.write_obj((i << 21) + 0x83, boot_pde.unchecked_add(i * 8))
-            .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
-    }
-
-    sregs.cr3 = boot_pml4.raw_value();
+    sregs.cr3 = PML4_START;
     sregs.cr4 |= X86_CR4_PAE;
     sregs.cr0 |= X86_CR0_PE | X86_CR0_PG;
     sregs.efer |= EFER_LME | EFER_LMA;
 
     vcpu.set_sregs(&sregs)
         .map_err(crate::error::Error::KvmIoctl)?;
+    Ok(())
+}
+
+fn setup_identity_map(mem: &vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
+    let ram_end = mem
+        .last_addr()
+        .raw_value()
+        .checked_add(1)
+        .ok_or_else(|| crate::error::Error::GuestMemory("guest RAM end overflow".into()))?;
+    let map_end = ram_end.div_ceil(HUGE_PAGE_2M).saturating_mul(HUGE_PAGE_2M);
+    let num_2mib = map_end / HUGE_PAGE_2M;
+    let num_pd = num_2mib.div_ceil(PD_ENTRIES);
+
+    if num_pd == 0 || num_pd > PD_ENTRIES {
+        return Err(crate::error::Error::GuestMemory(format!(
+            "cannot identity-map {ram_end:#x} bytes of guest RAM"
+        )));
+    }
+
+    // Page tables must stay below the kernel cmdline and outside other boot data.
+    let pt_end = PD_TABLES_START
+        .checked_add(num_pd.saturating_mul(PAGE_SIZE))
+        .ok_or_else(|| crate::error::Error::GuestMemory("page table range overflow".into()))?;
+    if pt_end > crate::boot::CMDLINE_START {
+        return Err(crate::error::Error::GuestMemory(format!(
+            "page tables [{PD_TABLES_START:#x}, {pt_end:#x}) overlap cmdline at {:#x}",
+            crate::boot::CMDLINE_START
+        )));
+    }
+
+    let pml4 = vm_memory::GuestAddress(PML4_START);
+    let pdpt = vm_memory::GuestAddress(PDPT_START);
+
+    // Single PML4 entry covering the low 512 GiB via one PDPT.
+    mem.write_obj(pdpt.raw_value() | PTE_PRESENT_WRITABLE, pml4)
+        .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
+
+    for pd_idx in 0..num_pd {
+        let pd_gpa = PD_TABLES_START + pd_idx * PAGE_SIZE;
+        mem.write_obj(
+            pd_gpa | PTE_PRESENT_WRITABLE,
+            pdpt.unchecked_add(pd_idx * 8),
+        )
+        .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
+
+        let pd = vm_memory::GuestAddress(pd_gpa);
+        let base_2mib = pd_idx * PD_ENTRIES;
+        for i in 0..PD_ENTRIES {
+            let global = base_2mib + i;
+            let entry = if global < num_2mib {
+                (global * HUGE_PAGE_2M) | PTE_PRESENT_WRITABLE_PS
+            } else {
+                0
+            };
+            mem.write_obj(entry, pd.unchecked_add(i * 8))
+                .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
+        }
+    }
+
+    for pd_idx in num_pd..PD_ENTRIES {
+        mem.write_obj(0u64, pdpt.unchecked_add(pd_idx * 8))
+            .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))?;
+    }
+
     Ok(())
 }
 
@@ -195,4 +256,96 @@ fn setup_fpu(vcpu: &kvm_ioctls::VcpuFd) -> crate::error::Result<()> {
     };
     vcpu.set_fpu(&fpu).map_err(crate::error::Error::KvmIoctl)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guest_mem(size: usize) -> vm_memory::GuestMemoryMmap<()> {
+        vm_memory::GuestMemoryMmap::<()>::from_ranges(&[(vm_memory::GuestAddress(0), size)])
+            .expect("guest memory")
+    }
+
+    fn identity_map_end(ram_size: u64) -> u64 {
+        ram_size.div_ceil(HUGE_PAGE_2M).saturating_mul(HUGE_PAGE_2M)
+    }
+
+    fn identity_map_pd_count(ram_size: u64) -> u64 {
+        let num_2mib = identity_map_end(ram_size) / HUGE_PAGE_2M;
+        num_2mib.div_ceil(PD_ENTRIES)
+    }
+
+    #[test]
+    fn map_sizing_rounds_up_to_2mib_and_pd_tables() {
+        assert_eq!(identity_map_end(256 * 1024 * 1024), 256 * 1024 * 1024);
+        assert_eq!(identity_map_pd_count(256 * 1024 * 1024), 1);
+
+        assert_eq!(identity_map_end(1024 * 1024 * 1024), 1024 * 1024 * 1024);
+        assert_eq!(identity_map_pd_count(1024 * 1024 * 1024), 1);
+
+        // Just over 1 GiB needs a second page directory.
+        let over = 1024 * 1024 * 1024 + super::HUGE_PAGE_2M;
+        assert_eq!(identity_map_pd_count(over), 2);
+
+        // Max kitsune RAM (3.25 GiB) needs four PDs.
+        assert_eq!(identity_map_pd_count(crate::memory::MAX_GUEST_MEM_SIZE), 4);
+    }
+
+    #[test]
+    fn identity_map_covers_past_1gib() {
+        let size = 2 * 1024 * 1024 * 1024; // 2 GiB
+        let mem = guest_mem(size);
+        super::setup_identity_map(&mem).expect("map");
+
+        let e0: u64 = mem
+            .read_obj(vm_memory::GuestAddress(super::PDPT_START))
+            .unwrap();
+        let e1: u64 = mem
+            .read_obj(vm_memory::GuestAddress(super::PDPT_START + 8))
+            .unwrap();
+        let e2: u64 = mem
+            .read_obj(vm_memory::GuestAddress(super::PDPT_START + 16))
+            .unwrap();
+        assert_ne!(e0 & 1, 0);
+        assert_ne!(e1 & 1, 0);
+        assert_eq!(e2, 0);
+
+        // First 2 MiB of the second GiB: PDE entry at global index 512.
+        let pd1 = super::PD_TABLES_START + super::PAGE_SIZE;
+        let pde: u64 = mem.read_obj(vm_memory::GuestAddress(pd1)).unwrap();
+        assert_eq!(
+            pde & super::PTE_PRESENT_WRITABLE_PS,
+            super::PTE_PRESENT_WRITABLE_PS
+        );
+        assert_eq!(pde & !0xfff, 1 << 30); // GPA 1 GiB
+    }
+
+    #[test]
+    fn identity_map_small_ram_still_works() {
+        let mem = guest_mem(64 * 1024 * 1024);
+        super::setup_identity_map(&mem).expect("map");
+        let pde0: u64 = mem
+            .read_obj(vm_memory::GuestAddress(super::PD_TABLES_START))
+            .unwrap();
+        assert_eq!(pde0, super::PTE_PRESENT_WRITABLE_PS); // GPA 0, PS|RW|P
+
+        let pde31: u64 = mem
+            .read_obj(vm_memory::GuestAddress(super::PD_TABLES_START + 31 * 8))
+            .unwrap();
+        assert_ne!(pde31 & 1, 0);
+        assert_eq!(pde31 & !0xfff, 31 * super::HUGE_PAGE_2M);
+
+        let pde32: u64 = mem
+            .read_obj(vm_memory::GuestAddress(super::PD_TABLES_START + 32 * 8))
+            .unwrap();
+        assert_eq!(pde32, 0);
+    }
+
+    #[test]
+    fn page_tables_fit_below_cmdline() {
+        let num_pd = identity_map_pd_count(crate::memory::MAX_GUEST_MEM_SIZE);
+        let pt_end = super::PD_TABLES_START + num_pd * super::PAGE_SIZE;
+        assert!(pt_end <= crate::boot::CMDLINE_START);
+    }
 }
