@@ -37,40 +37,163 @@ const MSR_IA32_TSC: u32 = 0x0000_0010;
 const MSR_IA32_MISC_ENABLE: u32 = 0x0000_01a0;
 const MSR_IA32_MISC_ENABLE_FAST_STRING: u64 = 1;
 
-/// Install host-supported CPUID with per-vCPU APIC ID and logical CPU count.
+/// Install host-supported CPUID with a consistent flat guest topology.
 pub fn setup_cpuid(
     kvm: &kvm_ioctls::Kvm,
     vcpu: &kvm_ioctls::VcpuFd,
     vcpu_id: u8,
     num_vcpus: u8,
 ) -> crate::error::Result<()> {
-    let mut cpuid = kvm
+    let cpuid = kvm
         .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
         .map_err(crate::error::Error::KvmIoctl)?;
 
-    for entry in cpuid.as_mut_slice() {
+    let mut entries = cpuid.as_slice().to_vec();
+    apply_cpu_topology(&mut entries, vcpu_id, num_vcpus);
+
+    let cpuid =
+        kvm_bindings::CpuId::from_entries(&entries).map_err(|_| crate::error::Error::CpuidSetup)?;
+    vcpu.set_cpuid2(&cpuid)
+        .map_err(crate::error::Error::KvmIoctl)?;
+    Ok(())
+}
+
+/// Bits of APIC ID that address logical processors within one package.
+fn package_id_shift() -> u32 {
+    u32::from(crate::config::MAX_VCPUS)
+        .next_power_of_two()
+        .trailing_zeros()
+}
+
+fn max_logical_processors(num_vcpus: u8) -> u32 {
+    u32::from(num_vcpus.next_power_of_two())
+}
+
+fn ensure_subleaf(entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>, function: u32, index: u32) {
+    if entries
+        .iter()
+        .any(|e| e.function == function && e.index == index)
+    {
+        return;
+    }
+    entries.push(kvm_bindings::kvm_cpuid_entry2 {
+        function,
+        index,
+        flags: kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+        eax: 0,
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+        padding: [0; 3],
+    });
+}
+
+fn apply_cpu_topology(
+    entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
+    vcpu_id: u8,
+    num_vcpus: u8,
+) {
+    debug_assert!(num_vcpus >= 1);
+
+    // Advertise leaf 0xB when missing so multi-vCPU guests can enumerate topology.
+    if let Some(leaf0) = entries.iter_mut().find(|e| e.function == 0)
+        && leaf0.eax < 0xb
+    {
+        leaf0.eax = 0xb;
+    }
+    ensure_subleaf(entries, 0xb, 0);
+    ensure_subleaf(entries, 0xb, 1);
+
+    let max_lps = max_logical_processors(num_vcpus);
+    let pkg_shift = package_id_shift();
+    const THREADS_PER_CORE: u32 = 1;
+    const THREAD_LEVEL_SHIFT: u32 = 0;
+
+    for entry in entries.iter_mut() {
         match entry.function {
-            1 => {
-                // EBX[31:24] = initial APIC ID; EBX[23:16] = logical processors.
-                entry.ebx = (entry.ebx & 0x0000_ffff)
-                    | (u32::from(num_vcpus) << 16)
-                    | (u32::from(vcpu_id) << 24);
+            0x1 => {
+                let brand = entry.ebx & 0xff;
+                entry.ebx =
+                    brand | (8 << 8) | ((max_lps & 0xff) << 16) | (u32::from(vcpu_id) << 24);
+                // ECX[31] hypervisor present.
+                entry.ecx |= 1 << 31;
+                // EDX[28] HTT: max-IDs field is valid when >1 logical processor.
                 if num_vcpus > 1 {
-                    // EDX bit 28: HTT (multi-threaded / multi-core topology present).
                     entry.edx |= 1 << 28;
+                } else {
+                    entry.edx &= !(1 << 28);
                 }
             }
-            0xb if entry.index == 0 => {
-                // Extended topology: x2APIC ID in EDX.
+            0xb => {
+                entry.flags = kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
                 entry.edx = u32::from(vcpu_id);
+                match entry.index {
+                    // Level type 1: SMT / logical processor.
+                    0 => {
+                        entry.eax = THREAD_LEVEL_SHIFT & 0x1f;
+                        entry.ebx = THREADS_PER_CORE & 0xffff;
+                        entry.ecx = 1 << 8;
+                    }
+                    // Level type 2: core (all vCPUs are cores in one package).
+                    1 => {
+                        entry.eax = pkg_shift & 0x1f;
+                        entry.ebx = u32::from(num_vcpus) & 0xffff;
+                        entry.ecx = 1 | (2 << 8);
+                    }
+                    n => {
+                        entry.eax = 0;
+                        entry.ebx = 0;
+                        entry.ecx = n;
+                    }
+                }
+            }
+            0x4 => {
+                // Invalid cache subleaf: leave zeros.
+                if entry.eax | entry.ebx | entry.ecx | entry.edx == 0 {
+                    continue;
+                }
+                let level = (entry.eax >> 5) & 0x7;
+                // EAX[25:14] = max IDs sharing this cache minus 1.
+                let share = match level {
+                    1 | 2 => THREADS_PER_CORE.saturating_sub(1),
+                    3 => u32::from(num_vcpus.saturating_sub(1)),
+                    _ => continue,
+                };
+                entry.eax = (entry.eax & !(0xfff << 14)) | ((share & 0xfff) << 14);
+                // EAX[31:26] = max core IDs in package minus 1.
+                let cores_m1 = u32::from(num_vcpus.saturating_sub(1));
+                entry.eax = (entry.eax & !(0x3f << 26)) | ((cores_m1 & 0x3f) << 26);
+            }
+            // AMD: NC / ApicIdCoreIdSize.
+            0x8000_0008 => {
+                let nc = u32::from(num_vcpus.saturating_sub(1)) & 0xff;
+                entry.ecx = (entry.ecx & !0xff) | nc;
+                entry.ecx = (entry.ecx & !(0xf << 12)) | ((pkg_shift.min(0xf)) << 12);
+            }
+            // AMD extended APIC ID.
+            0x8000_001e => {
+                entry.eax = u32::from(vcpu_id);
+                // EBX[7:0] compute unit id; [15:8] threads per CU minus 1.
+                entry.ebx = u32::from(vcpu_id) | ((THREADS_PER_CORE.saturating_sub(1)) << 8);
+                entry.ecx = 0;
             }
             _ => {}
         }
     }
 
-    vcpu.set_cpuid2(&cpuid)
-        .map_err(crate::error::Error::KvmIoctl)?;
-    Ok(())
+    // Leaf 0x1F is preferred over 0xB when present: mirror our 0xB topology.
+    if entries.iter().any(|e| e.function == 0x1f) {
+        let topology: Vec<_> = entries
+            .iter()
+            .filter(|e| e.function == 0xb)
+            .cloned()
+            .collect();
+        entries.retain(|e| e.function != 0x1f);
+        for mut e in topology {
+            e.function = 0x1f;
+            entries.push(e);
+        }
+    }
 }
 
 /// Configure a vCPU for 16-bit real mode with CS base 0 and the given entry RIP.
@@ -347,5 +470,109 @@ mod tests {
         let num_pd = identity_map_pd_count(crate::memory::MAX_GUEST_MEM_SIZE);
         let pt_end = super::PD_TABLES_START + num_pd * super::PAGE_SIZE;
         assert!(pt_end <= crate::boot::CMDLINE_START);
+    }
+
+    fn blank_entry(function: u32, index: u32) -> kvm_bindings::kvm_cpuid_entry2 {
+        kvm_bindings::kvm_cpuid_entry2 {
+            function,
+            index,
+            flags: 0,
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            padding: [0; 3],
+        }
+    }
+
+    #[test]
+    fn topology_leaf1_and_0xb_for_four_vcpus() {
+        let mut entries = vec![
+            blank_entry(0, 0),
+            blank_entry(1, 0),
+            // Host only advertised SMT level; core level must be inserted.
+            blank_entry(0xb, 0),
+        ];
+        entries[0].eax = 0x1; // max leaf below 0xB before normalize
+        entries[1].ebx = 0x0000_0800;
+        entries[1].edx = 0;
+
+        super::apply_cpu_topology(&mut entries, 3, 4);
+
+        let leaf0 = entries.iter().find(|e| e.function == 0).unwrap();
+        assert!(leaf0.eax >= 0xb);
+
+        let leaf1 = entries.iter().find(|e| e.function == 1).unwrap();
+        assert_eq!((leaf1.ebx >> 24) & 0xff, 3); // APIC ID
+        assert_eq!((leaf1.ebx >> 16) & 0xff, 4); // max LPs (power of two)
+        assert_eq!((leaf1.ebx >> 8) & 0xff, 8); // CLFLUSH line size
+        assert_ne!(leaf1.edx & (1 << 28), 0); // HTT
+        assert_ne!(leaf1.ecx & (1 << 31), 0); // hypervisor
+
+        let smt = entries
+            .iter()
+            .find(|e| e.function == 0xb && e.index == 0)
+            .unwrap();
+        assert_eq!(smt.eax & 0x1f, 0);
+        assert_eq!(smt.ebx & 0xffff, 1);
+        assert_eq!((smt.ecx >> 8) & 0xff, 1);
+        assert_eq!(smt.edx, 3);
+
+        let core = entries
+            .iter()
+            .find(|e| e.function == 0xb && e.index == 1)
+            .unwrap();
+        assert_eq!(core.eax & 0x1f, super::package_id_shift());
+        assert_eq!(core.ebx & 0xffff, 4);
+        assert_eq!((core.ecx >> 8) & 0xff, 2);
+        assert_eq!(core.edx, 3);
+    }
+
+    #[test]
+    fn topology_single_vcpu_clears_htt() {
+        let mut entries = vec![blank_entry(0, 0), blank_entry(1, 0)];
+        entries[0].eax = 0xd;
+        entries[1].edx = 1 << 28;
+        super::apply_cpu_topology(&mut entries, 0, 1);
+        let leaf1 = entries.iter().find(|e| e.function == 1).unwrap();
+        assert_eq!(leaf1.edx & (1 << 28), 0);
+        assert_eq!((leaf1.ebx >> 16) & 0xff, 1);
+    }
+
+    #[test]
+    fn topology_leaf_1f_mirrors_0xb() {
+        let mut entries = vec![
+            blank_entry(0, 0),
+            blank_entry(1, 0),
+            blank_entry(0xb, 0),
+            blank_entry(0xb, 1),
+            blank_entry(0x1f, 0),
+        ];
+        entries[0].eax = 0x1f;
+        super::apply_cpu_topology(&mut entries, 1, 2);
+        let b0 = entries
+            .iter()
+            .find(|e| e.function == 0xb && e.index == 0)
+            .unwrap();
+        let f0 = entries
+            .iter()
+            .find(|e| e.function == 0x1f && e.index == 0)
+            .unwrap();
+        assert_eq!(f0.eax, b0.eax);
+        assert_eq!(f0.ebx, b0.ebx);
+        assert_eq!(f0.ecx, b0.ecx);
+        assert_eq!(f0.edx, b0.edx);
+    }
+
+    #[test]
+    fn topology_leaf4_l3_shared_by_all_vcpus() {
+        let mut entries = vec![blank_entry(0, 0), blank_entry(1, 0), blank_entry(4, 0)];
+        entries[0].eax = 0x4;
+        // Cache level 3 in EAX[7:5]
+        entries[2].eax = 3 << 5;
+        super::apply_cpu_topology(&mut entries, 0, 8);
+        let l3 = entries.iter().find(|e| e.function == 4).unwrap();
+        assert_eq!((l3.eax >> 14) & 0xfff, 7); // num_vcpus - 1
+        assert_eq!((l3.eax >> 26) & 0x3f, 7); // cores - 1
     }
 }
