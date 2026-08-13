@@ -55,6 +55,9 @@ pub enum Error {
     #[error("failed to set model-specific registers")]
     MsrSetup,
 
+    #[error("failed to configure guest CPUID")]
+    CpuidSetup,
+
     #[error("serial device error: {0}")]
     Serial(String),
 
