@@ -192,12 +192,18 @@ impl Vmm {
                 uid: 1,
             });
         }
-        crate::acpi::install_tables(&self.guest_mem, &virtio, self.num_vcpus)?;
+        let rsdp = crate::acpi::install_tables(&self.guest_mem, &virtio, self.num_vcpus)?;
 
-        let entry = crate::boot::load_linux(&self.guest_mem, config)?;
+        let entry = crate::boot::load_linux(&self.guest_mem, config, rsdp)?;
 
-        // BSP runs the kernel entry in long mode.
-        crate::vcpu::setup_long_mode(&self.vcpus[0], &self.guest_mem, entry)?;
+        match entry {
+            crate::boot::KernelEntry::Linux64 { rip } => {
+                crate::vcpu::setup_long_mode(&self.vcpus[0], &self.guest_mem, rip)?;
+            }
+            crate::boot::KernelEntry::Pvh { rip, start_info } => {
+                crate::vcpu::setup_pvh(&self.vcpus[0], &self.guest_mem, rip, start_info)?;
+            }
+        }
 
         // APs wait for INIT/SIPI from the BSP (handled by the in-kernel irqchip).
         for ap in self.vcpus.iter().skip(1) {

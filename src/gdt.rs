@@ -1,4 +1,4 @@
-//! Minimal GDT helpers for 64-bit Linux boot.
+//! Minimal GDT helpers for 64-bit Linux boot and 32-bit PVH.
 
 use vm_memory::Address as _;
 use vm_memory::bytes::Bytes as _;
@@ -69,9 +69,15 @@ impl SegmentDescriptor {
     }
 
     fn to_kvm_segment(self, table_index: usize) -> kvm_bindings::kvm_segment {
+        // KVM/VMCS stores the already-scaled limit. G=1 means the descriptor
+        // limit is in 4 KiB pages, so expand to the byte limit used for checks.
+        let mut limit = self.limit();
+        if self.g() != 0 {
+            limit = (limit << 12) | 0xfff;
+        }
         kvm_bindings::kvm_segment {
             base: self.base(),
-            limit: self.limit(),
+            limit,
             selector: (table_index * 8) as u16,
             type_: self.segment_type(),
             present: self.p(),
@@ -87,17 +93,30 @@ impl SegmentDescriptor {
     }
 }
 
-/// NULL, 64-bit code, data, and TSS descriptors used at boot.
+/// NULL, code, data, and TSS descriptors used at boot.
 pub struct BootGdt {
     entries: [SegmentDescriptor; 4],
 }
 
 impl BootGdt {
+    /// Long-mode GDT: 64-bit code at selector 0x08.
     pub fn new() -> Self {
         Self {
             entries: [
                 SegmentDescriptor::from(0, 0, 0),
                 SegmentDescriptor::from(0xa09b, 0, 0xfffff),
+                SegmentDescriptor::from(0xc093, 0, 0xfffff),
+                SegmentDescriptor::from(0x808b, 0, 0xfffff),
+            ],
+        }
+    }
+
+    /// PVH GDT: 32-bit protected-mode code at selector 0x08 (paging off).
+    pub fn pvh() -> Self {
+        Self {
+            entries: [
+                SegmentDescriptor::from(0, 0, 0),
+                SegmentDescriptor::from(0xc09b, 0, 0xfffff),
                 SegmentDescriptor::from(0xc093, 0, 0xfffff),
                 SegmentDescriptor::from(0x808b, 0, 0xfffff),
             ],
@@ -136,6 +155,32 @@ impl BootGdt {
 impl Default for BootGdt {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn long_mode_code_is_64bit() {
+        let gdt = super::BootGdt::new();
+        let cs = gdt.code_segment();
+        assert_eq!(cs.l, 1);
+        assert_eq!(cs.db, 0);
+        assert_eq!(cs.selector, 0x08);
+        assert_eq!(cs.limit, 0xffff_ffff);
+    }
+
+    #[test]
+    fn pvh_code_is_32bit() {
+        let gdt = super::BootGdt::pvh();
+        let cs = gdt.code_segment();
+        assert_eq!(cs.l, 0);
+        assert_eq!(cs.db, 1);
+        assert_eq!(cs.selector, 0x08);
+        assert_eq!(cs.type_, 0xb);
+        assert_eq!(cs.present, 1);
+        assert_eq!(cs.g, 1);
+        assert_eq!(cs.limit, 0xffff_ffff);
     }
 }
 
