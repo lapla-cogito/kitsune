@@ -1,4 +1,4 @@
-//! vCPU register setup for real mode and 64-bit Linux boot.
+//! vCPU register setup for real mode, PVH, and 64-bit Linux boot.
 
 use vm_memory::Address as _;
 use vm_memory::GuestMemoryBackend as _;
@@ -226,6 +226,22 @@ pub fn setup_long_mode(
     Ok(())
 }
 
+/// Configure a vCPU for PVH (32-bit protected mode, paging disabled).
+///
+/// `entry` is `XEN_ELFNOTE_PHYS32_ENTRY`. `start_info` is written to `RBX`.
+pub fn setup_pvh(
+    vcpu: &kvm_ioctls::VcpuFd,
+    mem: &vm_memory::GuestMemoryMmap<()>,
+    entry: u64,
+    start_info: u64,
+) -> crate::error::Result<()> {
+    setup_boot_msrs(vcpu)?;
+    setup_sregs_pvh(vcpu, mem)?;
+    setup_regs_pvh(vcpu, entry, start_info)?;
+    setup_fpu(vcpu)?;
+    Ok(())
+}
+
 fn setup_boot_msrs(vcpu: &kvm_ioctls::VcpuFd) -> crate::error::Result<()> {
     let entry = |index, data| kvm_bindings::kvm_msr_entry {
         index,
@@ -287,6 +303,43 @@ fn setup_sregs_long_mode(
     sregs.cr4 |= X86_CR4_PAE;
     sregs.cr0 |= X86_CR0_PE | X86_CR0_PG;
     sregs.efer |= EFER_LME | EFER_LMA;
+
+    vcpu.set_sregs(&sregs)
+        .map_err(crate::error::Error::KvmIoctl)?;
+    Ok(())
+}
+
+fn setup_sregs_pvh(
+    vcpu: &kvm_ioctls::VcpuFd,
+    mem: &vm_memory::GuestMemoryMmap<()>,
+) -> crate::error::Result<()> {
+    let mut sregs = vcpu.get_sregs().map_err(crate::error::Error::KvmIoctl)?;
+
+    let gdt = crate::gdt::BootGdt::pvh();
+    gdt.write_to_mem(mem)?;
+    crate::gdt::write_idt(mem)?;
+
+    sregs.gdt.base = crate::gdt::BOOT_GDT_OFFSET;
+    sregs.gdt.limit = gdt.limit();
+    sregs.idt.base = crate::gdt::BOOT_IDT_OFFSET;
+    sregs.idt.limit = (std::mem::size_of::<u64>() - 1) as u16;
+
+    let code = gdt.code_segment();
+    let data = gdt.data_segment();
+    let tss = gdt.tss_segment();
+    sregs.cs = code;
+    sregs.ds = data;
+    sregs.es = data;
+    sregs.fs = data;
+    sregs.gs = data;
+    sregs.ss = data;
+    sregs.tr = tss;
+
+    // Xen PVH: PE=1, paging off, no long mode.
+    sregs.cr0 = X86_CR0_PE;
+    sregs.cr3 = 0;
+    sregs.cr4 = 0;
+    sregs.efer = 0;
 
     vcpu.set_sregs(&sregs)
         .map_err(crate::error::Error::KvmIoctl)?;
@@ -364,6 +417,24 @@ fn setup_regs_long_mode(vcpu: &kvm_ioctls::VcpuFd, entry: u64) -> crate::error::
         rsp: BOOT_STACK_POINTER,
         rbp: BOOT_STACK_POINTER,
         rsi: ZERO_PAGE_START,
+        ..Default::default()
+    };
+    vcpu.set_regs(&regs)
+        .map_err(crate::error::Error::KvmIoctl)?;
+    Ok(())
+}
+
+fn setup_regs_pvh(
+    vcpu: &kvm_ioctls::VcpuFd,
+    entry: u64,
+    start_info: u64,
+) -> crate::error::Result<()> {
+    let regs = kvm_bindings::kvm_regs {
+        rflags: 2,
+        rip: entry,
+        rsp: BOOT_STACK_POINTER,
+        rbp: BOOT_STACK_POINTER,
+        rbx: start_info,
         ..Default::default()
     };
     vcpu.set_regs(&regs)
