@@ -158,6 +158,12 @@ impl Default for BootGdt {
     }
 }
 
+/// Write a single-entry IDT (unused vector table) for boot.
+pub fn write_idt(mem: &vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
+    mem.write_obj(0u64, vm_memory::GuestAddress(BOOT_IDT_OFFSET))
+        .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -182,10 +188,4 @@ mod tests {
         assert_eq!(cs.g, 1);
         assert_eq!(cs.limit, 0xffff_ffff);
     }
-}
-
-/// Write a single-entry IDT (unused vector table) for boot.
-pub fn write_idt(mem: &vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
-    mem.write_obj(0u64, vm_memory::GuestAddress(BOOT_IDT_OFFSET))
-        .map_err(|e| crate::error::Error::MemoryAccess(e.to_string()))
 }

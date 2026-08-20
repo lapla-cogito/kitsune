@@ -332,27 +332,33 @@ mod tests {
 
     #[test]
     fn bzimage_linux64_entry_is_load_plus_0x200() {
-        let mut load = KernelLoaderResult::default();
-        load.kernel_load = GuestAddress(0x0010_0000);
-        load.setup_header = Some(linux_loader::loader::bootparam::setup_header {
-            header: super::KERNEL_HDR_MAGIC,
+        let load = KernelLoaderResult {
+            kernel_load: GuestAddress(0x0010_0000),
+            setup_header: Some(linux_loader::loader::bootparam::setup_header {
+                header: super::KERNEL_HDR_MAGIC,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert_eq!(super::linux64_entry(&load).unwrap(), 0x0010_0200);
     }
 
     #[test]
     fn elf_linux64_entry_converts_kernel_va() {
-        let mut load = KernelLoaderResult::default();
-        load.kernel_load = GuestAddress(0xffff_ffff_8235_3eb0);
-        load.setup_header = None;
+        let load = KernelLoaderResult {
+            kernel_load: GuestAddress(0xffff_ffff_8235_3eb0),
+            setup_header: None,
+            ..Default::default()
+        };
         assert_eq!(super::linux64_entry(&load).unwrap(), 0x0235_3eb0);
     }
 
     #[test]
     fn elf_linux64_entry_keeps_physical_address() {
-        let mut load = KernelLoaderResult::default();
-        load.kernel_load = GuestAddress(0x0235_3eb0);
+        let load = KernelLoaderResult {
+            kernel_load: GuestAddress(0x0235_3eb0),
+            ..Default::default()
+        };
         assert_eq!(super::linux64_entry(&load).unwrap(), 0x0235_3eb0);
     }
 
