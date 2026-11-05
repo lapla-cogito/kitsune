@@ -199,6 +199,46 @@ impl VirtioNet {
     }
 }
 
+impl super::mmio_device::MmioDevice for VirtioNet {
+    fn kind(&self) -> super::mmio_device::MmioKind {
+        super::mmio_device::MmioKind::Net
+    }
+
+    fn range(&self) -> std::ops::Range<u64> {
+        self.dev.range()
+    }
+
+    fn acpi(&self) -> crate::acpi::VirtioMmioAcpi {
+        crate::acpi::VirtioMmioAcpi {
+            base: Self::MMIO_BASE as u32,
+            size: super::virtio_mmio::MMIO_SIZE as u32,
+            irq: Self::IRQ,
+            uid: 1,
+        }
+    }
+
+    fn read(&self, addr: u64, data: &mut [u8]) {
+        VirtioNet::read(self, addr, data);
+    }
+
+    fn write(
+        &self,
+        addr: u64,
+        data: &[u8],
+        mem: &vm_memory::GuestMemoryMmap<()>,
+    ) -> crate::error::Result<()> {
+        VirtioNet::write(self, addr, data, mem)
+    }
+
+    fn start(&self, mem: vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
+        self.start_worker(mem)
+    }
+
+    fn stop(&self) -> crate::error::Result<()> {
+        self.stop_worker()
+    }
+}
+
 fn config_space(mac: &[u8; 6]) -> [u8; CONFIG_SIZE] {
     let mut cfg = [0u8; CONFIG_SIZE];
     cfg[..6].copy_from_slice(mac);

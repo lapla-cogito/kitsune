@@ -325,6 +325,46 @@ impl VirtioBlock {
     }
 }
 
+impl super::mmio_device::MmioDevice for VirtioBlock {
+    fn kind(&self) -> super::mmio_device::MmioKind {
+        super::mmio_device::MmioKind::Block
+    }
+
+    fn range(&self) -> std::ops::Range<u64> {
+        self.dev.range()
+    }
+
+    fn acpi(&self) -> crate::acpi::VirtioMmioAcpi {
+        crate::acpi::VirtioMmioAcpi {
+            base: Self::MMIO_BASE as u32,
+            size: super::virtio_mmio::MMIO_SIZE as u32,
+            irq: Self::IRQ,
+            uid: 0,
+        }
+    }
+
+    fn read(&self, addr: u64, data: &mut [u8]) {
+        VirtioBlock::read(self, addr, data);
+    }
+
+    fn write(
+        &self,
+        addr: u64,
+        data: &[u8],
+        mem: &vm_memory::GuestMemoryMmap<()>,
+    ) -> crate::error::Result<()> {
+        VirtioBlock::write(self, addr, data, mem)
+    }
+
+    fn start(&self, mem: vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
+        self.start_worker(mem)
+    }
+
+    fn stop(&self) -> crate::error::Result<()> {
+        self.stop_worker()
+    }
+}
+
 struct OpenedDisk {
     buffered_file: std::fs::File,
     direct_file: Option<std::fs::File>,

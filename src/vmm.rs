@@ -19,8 +19,7 @@ pub struct Vmm {
     vcpus: Vec<kvm_ioctls::VcpuFd>,
     serial: Option<crate::devices::SerialConsole>,
     legacy_io: crate::devices::LegacyIo,
-    block: Option<crate::devices::VirtioBlock>,
-    net: Option<crate::devices::VirtioNet>,
+    mmio_devices: Vec<std::sync::Arc<dyn crate::devices::MmioDevice>>,
     num_vcpus: u8,
     /// When true, `VcpuExit::Hlt` ends `run()`.
     exit_on_hlt: bool,
@@ -79,8 +78,7 @@ impl Vmm {
             vcpus,
             serial: Some(serial),
             legacy_io: crate::devices::LegacyIo::new(),
-            block: None,
-            net: None,
+            mmio_devices: Vec::new(),
             num_vcpus: config.num_vcpus,
             exit_on_hlt: true,
             idle_exits_disabled: false,
@@ -120,23 +118,37 @@ impl Vmm {
 
     /// Attach a virtio-blk device backed by the given host path.
     pub fn add_block_device(&mut self, path: &std::path::Path) -> crate::error::Result<()> {
-        if self.block.is_some() {
+        if self
+            .mmio_devices
+            .iter()
+            .any(|dev| dev.kind() == crate::devices::MmioKind::Block)
+        {
             return Err(crate::error::Error::Block(
                 "only one block device is supported".into(),
             ));
         }
-        self.block = Some(crate::devices::VirtioBlock::new(path, &self.vm)?);
+        self.mmio_devices
+            .push(std::sync::Arc::new(crate::devices::VirtioBlock::new(
+                path, &self.vm,
+            )?));
         Ok(())
     }
 
     /// Attach a virtio-net device backed by the given host TAP interface.
     pub fn add_net_device(&mut self, tap_ifname: &str) -> crate::error::Result<()> {
-        if self.net.is_some() {
+        if self
+            .mmio_devices
+            .iter()
+            .any(|dev| dev.kind() == crate::devices::MmioKind::Net)
+        {
             return Err(crate::error::Error::Net(
                 "only one network device is supported".into(),
             ));
         }
-        self.net = Some(crate::devices::VirtioNet::new(tap_ifname, &self.vm)?);
+        self.mmio_devices
+            .push(std::sync::Arc::new(crate::devices::VirtioNet::new(
+                tap_ifname, &self.vm,
+            )?));
         Ok(())
     }
 
@@ -175,23 +187,7 @@ impl Vmm {
         &mut self,
         config: &crate::boot::KernelBootConfig<'_>,
     ) -> crate::error::Result<()> {
-        let mut virtio = Vec::new();
-        if self.block.is_some() {
-            virtio.push(crate::acpi::VirtioMmioAcpi {
-                base: crate::devices::VirtioBlock::MMIO_BASE as u32,
-                size: 0x1000,
-                irq: crate::devices::VirtioBlock::IRQ,
-                uid: 0,
-            });
-        }
-        if self.net.is_some() {
-            virtio.push(crate::acpi::VirtioMmioAcpi {
-                base: crate::devices::VirtioNet::MMIO_BASE as u32,
-                size: 0x1000,
-                irq: crate::devices::VirtioNet::IRQ,
-                uid: 1,
-            });
-        }
+        let virtio: Vec<_> = self.mmio_devices.iter().map(|dev| dev.acpi()).collect();
         let rsdp = crate::acpi::install_tables(&self.guest_mem, &virtio, self.num_vcpus)?;
 
         let entry = crate::boot::load_linux(&self.guest_mem, config, rsdp)?;
@@ -234,15 +230,16 @@ impl Vmm {
         let legacy_io =
             std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.legacy_io)));
 
-        let block = self.block.take().map(std::sync::Arc::new);
-        if let Some(block) = block.as_ref() {
-            block.start_worker(self.guest_mem.clone())?;
+        let mmio_devices = self.mmio_devices.clone();
+        for (started, dev) in mmio_devices.iter().enumerate() {
+            if let Err(e) = dev.start(self.guest_mem.clone()) {
+                for running in mmio_devices.iter().take(started) {
+                    let _ = running.stop();
+                }
+                return Err(e);
+            }
         }
         let mem = self.guest_mem.clone();
-        let net = self.net.take().map(std::sync::Arc::new);
-        if let Some(net) = net.as_ref() {
-            net.start_worker(mem.clone())?;
-        }
         let exit_on_hlt = self.exit_on_hlt;
         let idle_exits_disabled = self.idle_exits_disabled;
 
@@ -260,8 +257,7 @@ impl Vmm {
                 kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
                 legacy_io: std::sync::Arc::clone(&legacy_io),
-                block: block.clone(),
-                net: net.clone(),
+                mmio_devices: mmio_devices.clone(),
                 mem: mem.clone(),
             };
             handles.push(
@@ -282,8 +278,7 @@ impl Vmm {
                 kick: std::sync::Arc::clone(&kick),
                 serial: std::sync::Arc::clone(&serial),
                 legacy_io: std::sync::Arc::clone(&legacy_io),
-                block: block.clone(),
-                net: net.clone(),
+                mmio_devices: mmio_devices.clone(),
                 mem,
             },
         );
@@ -315,17 +310,12 @@ impl Vmm {
         {
             first_err = Some(e);
         }
-        if let Some(block) = block.as_ref()
-            && let Err(e) = block.stop_worker()
-            && first_err.is_none()
-        {
-            first_err = Some(e);
-        }
-        if let Some(net) = net.as_ref()
-            && let Err(e) = net.stop_worker()
-            && first_err.is_none()
-        {
-            first_err = Some(e);
+        for dev in &mmio_devices {
+            if let Err(e) = dev.stop()
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
         }
 
         if let Ok(s) = std::sync::Arc::try_unwrap(serial) {
@@ -334,8 +324,6 @@ impl Vmm {
         if let Ok(io) = std::sync::Arc::try_unwrap(legacy_io) {
             self.legacy_io = io.into_inner().unwrap_or_else(|e| e.into_inner());
         }
-        self.block = block.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
-        self.net = net.and_then(|a| std::sync::Arc::try_unwrap(a).ok());
 
         match first_err {
             Some(e) => Err(e),
@@ -352,8 +340,7 @@ struct VcpuRunCtx {
     kick: std::sync::Arc<VcpuKickRegistry>,
     serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
     legacy_io: std::sync::Arc<std::sync::Mutex<crate::devices::LegacyIo>>,
-    block: Option<std::sync::Arc<crate::devices::VirtioBlock>>,
-    net: Option<std::sync::Arc<crate::devices::VirtioNet>>,
+    mmio_devices: Vec<std::sync::Arc<dyn crate::devices::MmioDevice>>,
     mem: vm_memory::GuestMemoryMmap<()>,
 }
 
@@ -426,29 +413,21 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                 }
             }
             kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
-                if let Some(dev) = ctx.block.as_ref()
-                    && dev.handles(addr)
+                if let Some(dev) = ctx
+                    .mmio_devices
+                    .iter()
+                    .find(|dev| dev.range().contains(&addr))
                 {
                     dev.read(addr, data);
-                    continue;
-                }
-                if let Some(net) = ctx.net.as_ref()
-                    && net.handles(addr)
-                {
-                    net.read(addr, data);
                 }
             }
             kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
-                if let Some(dev) = ctx.block.as_ref()
-                    && dev.handles(addr)
+                if let Some(dev) = ctx
+                    .mmio_devices
+                    .iter()
+                    .find(|dev| dev.range().contains(&addr))
                 {
                     dev.write(addr, data, &ctx.mem)?;
-                    continue;
-                }
-                if let Some(net) = ctx.net.as_ref()
-                    && net.handles(addr)
-                {
-                    net.write(addr, data, &ctx.mem)?;
                 }
             }
             kvm_ioctls::VcpuExit::Hlt => {
