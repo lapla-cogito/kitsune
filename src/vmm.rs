@@ -17,8 +17,7 @@ pub struct Vmm {
     guest_mem: vm_memory::GuestMemoryMmap<()>,
     vm: kvm_ioctls::VmFd,
     vcpus: Vec<kvm_ioctls::VcpuFd>,
-    serial: Option<crate::devices::SerialConsole>,
-    legacy_io: crate::devices::LegacyIo,
+    pio: crate::devices::PioBus,
     mmio_devices: Vec<std::sync::Arc<dyn crate::devices::MmioDevice>>,
     num_vcpus: u8,
     /// When true, `VcpuExit::Hlt` ends `run()`.
@@ -69,15 +68,14 @@ impl Vmm {
             vcpus.push(vcpu);
         }
 
-        let serial = crate::devices::SerialConsole::new(&vm)?;
+        let pio = crate::devices::PioBus::new(&vm)?;
 
         Ok(Self {
             _kvm: kvm,
             guest_mem,
             vm,
             vcpus,
-            serial: Some(serial),
-            legacy_io: crate::devices::LegacyIo::new(),
+            pio,
             mmio_devices: Vec::new(),
             num_vcpus: config.num_vcpus,
             exit_on_hlt: true,
@@ -220,15 +218,8 @@ impl Vmm {
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kick = std::sync::Arc::new(VcpuKickRegistry::new());
-        let serial = std::sync::Arc::new(std::sync::Mutex::new(
-            self.serial
-                .take()
-                .expect("serial console is installed at construction"),
-        ));
-        let stdin_worker = crate::devices::StdinWorker::start(std::sync::Arc::clone(&serial))?;
-
-        let legacy_io =
-            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.legacy_io)));
+        let pio = self.pio.clone();
+        let stdin_worker = crate::devices::StdinWorker::start(pio.serial())?;
 
         let mmio_devices = self.mmio_devices.clone();
         for (started, dev) in mmio_devices.iter().enumerate() {
@@ -255,8 +246,7 @@ impl Vmm {
                 idle_exits_disabled,
                 stop: std::sync::Arc::clone(&stop),
                 kick: std::sync::Arc::clone(&kick),
-                serial: std::sync::Arc::clone(&serial),
-                legacy_io: std::sync::Arc::clone(&legacy_io),
+                pio: pio.clone(),
                 mmio_devices: mmio_devices.clone(),
                 mem: mem.clone(),
             };
@@ -276,8 +266,7 @@ impl Vmm {
                 idle_exits_disabled,
                 stop: std::sync::Arc::clone(&stop),
                 kick: std::sync::Arc::clone(&kick),
-                serial: std::sync::Arc::clone(&serial),
-                legacy_io: std::sync::Arc::clone(&legacy_io),
+                pio: pio.clone(),
                 mmio_devices: mmio_devices.clone(),
                 mem,
             },
@@ -318,13 +307,6 @@ impl Vmm {
             }
         }
 
-        if let Ok(s) = std::sync::Arc::try_unwrap(serial) {
-            self.serial = Some(s.into_inner().unwrap_or_else(|e| e.into_inner()));
-        }
-        if let Ok(io) = std::sync::Arc::try_unwrap(legacy_io) {
-            self.legacy_io = io.into_inner().unwrap_or_else(|e| e.into_inner());
-        }
-
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -338,8 +320,7 @@ struct VcpuRunCtx {
     idle_exits_disabled: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     kick: std::sync::Arc<VcpuKickRegistry>,
-    serial: std::sync::Arc<std::sync::Mutex<crate::devices::SerialConsole>>,
-    legacy_io: std::sync::Arc<std::sync::Mutex<crate::devices::LegacyIo>>,
+    pio: crate::devices::PioBus,
     mmio_devices: Vec<std::sync::Arc<dyn crate::devices::MmioDevice>>,
     mem: vm_memory::GuestMemoryMmap<()>,
 }
@@ -376,41 +357,16 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                     }
                     break;
                 }
-                if crate::devices::SerialConsole::handles_port(port) {
-                    ctx.serial
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .bus_write(port, data)?;
-                } else if crate::devices::LegacyIo::handles_port(port) {
-                    let action = ctx
-                        .legacy_io
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .bus_write(port, data);
-                    match action {
-                        crate::devices::PowerAction::Reset
-                        | crate::devices::PowerAction::Shutdown => {
-                            request_stop(&ctx);
-                            break;
-                        }
-                        crate::devices::PowerAction::None => {}
+                match ctx.pio.write(port, data)? {
+                    crate::devices::PowerAction::Reset | crate::devices::PowerAction::Shutdown => {
+                        request_stop(&ctx);
+                        break;
                     }
+                    crate::devices::PowerAction::None => {}
                 }
             }
             kvm_ioctls::VcpuExit::IoIn(port, data) => {
-                if crate::devices::SerialConsole::handles_port(port) {
-                    ctx.serial
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .bus_read(port, data);
-                } else if crate::devices::LegacyIo::handles_port(port) {
-                    ctx.legacy_io
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .bus_read(port, data);
-                } else {
-                    data.fill(0xff);
-                }
+                ctx.pio.read(port, data);
             }
             kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
                 if let Some(dev) = ctx
