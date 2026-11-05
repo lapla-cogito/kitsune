@@ -160,14 +160,26 @@ struct WorkerOutcome {
 
 /// Virtio-mmio block device backed by a host file.
 pub struct VirtioBlock {
-    base: u64,
-    transport: std::sync::Arc<std::sync::Mutex<BlockTransport>>,
+    dev: super::virtio_dev::VirtioDev<BlockTransport, WorkerOutcome>,
     /// Taken by the worker at start. Restored when the worker stops.
     disk: std::sync::Mutex<Option<BlockDisk>>,
-    /// Wakes the worker on queue notify (ioeventfd / MMIO fallback) and stop.
-    kick: vmm_sys_util::eventfd::EventFd,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    worker: std::sync::Mutex<Option<std::thread::JoinHandle<WorkerOutcome>>>,
+}
+
+impl super::virtio_dev::VirtioState for BlockTransport {
+    fn mmio(&self) -> &super::virtio_mmio::VirtioMmio {
+        &self.mmio
+    }
+
+    fn mmio_mut(&mut self) -> &mut super::virtio_mmio::VirtioMmio {
+        &mut self.mmio
+    }
+
+    fn copy_config(&self, dest: &mut [u8]) -> usize {
+        let cfg = config_space(self.capacity_sectors);
+        let n = cfg.len().min(dest.len());
+        dest[..n].copy_from_slice(&cfg[..n]);
+        cfg.len()
+    }
 }
 
 impl VirtioBlock {
@@ -197,29 +209,26 @@ impl VirtioBlock {
             advertised_features(opened.readonly),
             1,
             QUEUE_MAX_SIZE,
-        )
-        .map_err(crate::error::Error::Block)?;
+        )?;
         mmio.register_irq(vm, VIRTIO_BLK_IRQ)
             .map_err(crate::error::Error::KvmIoctl)?;
         mmio.register_ioeventfds(vm)
             .map_err(crate::error::Error::KvmIoctl)?;
 
-        let kick = mmio
-            .notify_fd()
-            .try_clone()
-            .map_err(|e| crate::error::Error::Block(e.to_string()))?;
-
         let scratch = AlignedBuf::new(SCRATCH_INITIAL).map_err(crate::error::Error::Block)?;
         let ring = io_uring::IoUring::new(8).ok();
         let use_direct = opened.direct_file.is_some();
-
-        Ok(Self {
-            base: VIRTIO_MMIO_BASE,
-            transport: std::sync::Arc::new(std::sync::Mutex::new(BlockTransport {
+        let dev = super::virtio_dev::VirtioDev::new(
+            VIRTIO_MMIO_BASE,
+            BlockTransport {
                 mmio,
                 capacity_sectors,
                 readonly: opened.readonly,
-            })),
+            },
+        )?;
+
+        Ok(Self {
+            dev,
             disk: std::sync::Mutex::new(Some(BlockDisk {
                 direct_file: opened.direct_file,
                 buffered_file: opened.buffered_file,
@@ -228,18 +237,14 @@ impl VirtioBlock {
                 scratch,
                 ring,
             })),
-            kick,
-            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            worker: std::sync::Mutex::new(None),
         })
     }
 
     /// Start the queue worker (polls the QueueNotify ioeventfd).
     pub fn start_worker(&self, mem: vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
-        let mut slot = self.worker.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_some() {
+        let Some(reservation) = self.dev.reserve() else {
             return Ok(());
-        }
+        };
 
         let disk = self
             .disk
@@ -251,18 +256,17 @@ impl VirtioBlock {
         // Keep disk reclaimable if spawn fails (closure drop would otherwise destroy it).
         let disk_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(disk)));
         let disk_for_worker = std::sync::Arc::clone(&disk_slot);
-
-        self.stop.store(false, std::sync::atomic::Ordering::SeqCst);
-        let transport = std::sync::Arc::clone(&self.transport);
-        let kick = match self.kick.try_clone() {
-            Ok(k) => k,
+        let transport = self.dev.state();
+        let kick = match self.dev.clone_kick() {
+            Ok(kick) => kick,
             Err(e) => {
                 *self.disk.lock().unwrap_or_else(|e| e.into_inner()) =
                     disk_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
                 return Err(crate::error::Error::Block(e.to_string()));
             }
         };
-        let stop = std::sync::Arc::clone(&self.stop);
+        let stop = self.dev.stop_flag();
+        self.dev.clear_stop();
 
         let handle = std::thread::Builder::new()
             .name("virtio-blk".into())
@@ -274,25 +278,22 @@ impl VirtioBlock {
                     .expect("block disk present for worker");
                 worker_loop(transport, disk, kick, mem, stop)
             });
-
-        match handle {
-            Ok(h) => {
-                *slot = Some(h);
-                Ok(())
-            }
+        let handle = match handle {
+            Ok(handle) => handle,
             Err(e) => {
                 *self.disk.lock().unwrap_or_else(|e| e.into_inner()) =
                     disk_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-                Err(crate::error::Error::Block(e.to_string()))
+                return Err(crate::error::Error::Block(e.to_string()));
             }
-        }
+        };
+        reservation.commit(handle);
+        Ok(())
     }
 
     /// Stop the worker, restore the disk handle, and propagate worker errors.
     pub fn stop_worker(&self) -> crate::error::Result<()> {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.kick.write(1);
-        let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        self.dev.request_stop();
+        let Some(handle) = self.dev.take_worker() else {
             return Ok(());
         };
         match handle.join() {
@@ -307,13 +308,11 @@ impl VirtioBlock {
     }
 
     pub fn handles(&self, addr: u64) -> bool {
-        (self.base..self.base + super::virtio_mmio::MMIO_SIZE).contains(&addr)
+        self.dev.handles(addr)
     }
 
     pub fn read(&self, addr: u64, data: &mut [u8]) {
-        let transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = config_space(transport.capacity_sectors);
-        transport.mmio.read(addr, data, &cfg);
+        self.dev.read(addr, data);
     }
 
     pub fn write(
@@ -322,25 +321,47 @@ impl VirtioBlock {
         data: &[u8],
         mem: &vm_memory::GuestMemoryMmap<()>,
     ) -> crate::error::Result<()> {
-        let notify = {
-            let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
-            transport
-                .mmio
-                .write(addr, data, mem)
-                .map_err(crate::error::Error::Block)?
-        };
-        if notify.is_some() {
-            self.kick
-                .write(1)
-                .map_err(|e| crate::error::Error::Block(e.to_string()))?;
-        }
-        Ok(())
+        self.dev.write(addr, data, mem)
     }
 }
 
-impl Drop for VirtioBlock {
-    fn drop(&mut self) {
-        let _ = self.stop_worker();
+impl super::mmio_device::MmioDevice for VirtioBlock {
+    fn kind(&self) -> super::mmio_device::MmioKind {
+        super::mmio_device::MmioKind::Block
+    }
+
+    fn range(&self) -> std::ops::Range<u64> {
+        self.dev.range()
+    }
+
+    fn acpi(&self) -> crate::acpi::VirtioMmioAcpi {
+        crate::acpi::VirtioMmioAcpi {
+            base: Self::MMIO_BASE as u32,
+            size: super::virtio_mmio::MMIO_SIZE as u32,
+            irq: Self::IRQ,
+            uid: 0,
+        }
+    }
+
+    fn read(&self, addr: u64, data: &mut [u8]) {
+        VirtioBlock::read(self, addr, data);
+    }
+
+    fn write(
+        &self,
+        addr: u64,
+        data: &[u8],
+        mem: &vm_memory::GuestMemoryMmap<()>,
+    ) -> crate::error::Result<()> {
+        VirtioBlock::write(self, addr, data, mem)
+    }
+
+    fn start(&self, mem: vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
+        self.start_worker(mem)
+    }
+
+    fn stop(&self) -> crate::error::Result<()> {
+        self.stop_worker()
     }
 }
 
@@ -519,9 +540,7 @@ fn process_queue(
 
     if used_any {
         let mut t = transport.lock().unwrap_or_else(|e| e.into_inner());
-        t.mmio
-            .signal_used_queue()
-            .map_err(crate::error::Error::Block)?;
+        t.mmio.signal_used_queue()?;
     }
     Ok(())
 }
