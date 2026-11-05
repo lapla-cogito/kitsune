@@ -8,6 +8,9 @@ mod virtio_net;
 
 pub(crate) use legacy_io::LegacyIo;
 pub(crate) use legacy_io::PowerAction;
+pub(crate) use legacy_io::SLEEP_CONTROL_PORT;
+pub(crate) use legacy_io::SLEEP_STATUS_PORT;
+pub(crate) use legacy_io::SLEEP_TYP_S5;
 pub(crate) use serial::SERIAL_IRQ;
 pub(crate) use serial::SerialConsole;
 pub(crate) use serial::StdinWorker;

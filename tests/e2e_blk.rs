@@ -45,7 +45,7 @@ fn run_blk(disk: &std::path::Path, cpus: u8, markers: &[&str]) -> String {
     let dir = guest::guest_dir();
     let args = blk_args(&dir.join("vmlinux"), &dir.join("initrd.img"), disk, cpus);
     let refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
-    run::run_until(&refs, std::time::Duration::from_secs(120), markers)
+    run::run_until(&refs, std::time::Duration::from_secs(120), markers).0
 }
 
 /// Device present, small write/readback, and multi-block (~32 KiB) I/O.

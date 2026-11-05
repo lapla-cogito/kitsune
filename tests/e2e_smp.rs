@@ -15,7 +15,7 @@ fn boot_two_vcpus_reports_online_cpus() {
     let kernel = dir.join("vmlinux");
     let initrd = dir.join("initrd.img");
 
-    let out = run::run_until(
+    let (out, _) = run::run_until(
         &[
             "run",
             "--kernel",

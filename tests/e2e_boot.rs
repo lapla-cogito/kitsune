@@ -15,7 +15,7 @@ fn boot_initrd_prints_marker() {
     let kernel = dir.join("vmlinux");
     let initrd = dir.join("initrd.img");
 
-    let out = run::run_until(
+    let (out, _) = run::run_until(
         &[
             "run",
             "--kernel",
@@ -32,4 +32,36 @@ fn boot_initrd_prints_marker() {
     );
     run::assert_contains(&out, "Linux version");
     run::assert_contains(&out, "kitsune-initrd-ok");
+}
+
+#[test]
+fn poweroff_exits_cleanly() {
+    kvm::require_kvm();
+    guest::prepare_guest();
+    let dir = guest::guest_dir();
+    let kernel = dir.join("vmlinux");
+    let initrd = dir.join("initrd.img");
+
+    let (output, code) = run::run_until(
+        &[
+            "run",
+            "--kernel",
+            kernel.to_str().unwrap(),
+            "--initrd",
+            initrd.to_str().unwrap(),
+            "--memory",
+            "512",
+            "--cmdline",
+            "console=ttyS0 reboot=k panic=1 pci=off nomodule kitsune.poweroff",
+        ],
+        std::time::Duration::from_secs(90),
+        &[],
+    );
+    run::assert_contains(&output, "kitsune-poweroff");
+    run::assert_contains(&output, "reboot: Power down");
+    assert!(
+        !output.contains("kitsune-poweroff-returned"),
+        "poweroff returned to guest userspace\n{output}"
+    );
+    assert_eq!(code, Some(0), "kitsune exit code {code:?}\n{output}");
 }

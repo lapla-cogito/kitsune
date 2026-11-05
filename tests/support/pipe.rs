@@ -68,12 +68,12 @@ pub fn wait_child(
     err: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     timeout: std::time::Duration,
     markers: &[&str],
-) -> String {
+) -> (String, Option<i32>) {
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         if start.elapsed() >= timeout {
             let _ = child.kill();
-            break;
+            break child.wait().ok();
         }
 
         let combined = {
@@ -85,24 +85,23 @@ pub fn wait_child(
         };
         if !markers.is_empty() && markers.iter().all(|m| combined.contains(m)) {
             let _ = child.kill();
-            break;
+            break child.wait().ok();
         }
 
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => break,
+            Err(_) => break None,
         }
-    }
-    let _ = child.wait();
+    };
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let o = out.lock().unwrap_or_else(|e| e.into_inner());
     let e = err.lock().unwrap_or_else(|e| e.into_inner());
-    let mut s = String::from_utf8_lossy(&o).into_owned();
-    s.push_str(&String::from_utf8_lossy(&e));
-    dump_guest_serial(markers, &s);
-    s
+    let mut output = String::from_utf8_lossy(&o).into_owned();
+    output.push_str(&String::from_utf8_lossy(&e));
+    dump_guest_serial(markers, &output);
+    (output, status.and_then(|s| s.code()))
 }
 
 pub fn kitsune_bin() -> std::path::PathBuf {

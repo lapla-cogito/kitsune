@@ -10,6 +10,7 @@ A KVM-based VMM written in Rust. Kitsune means "Fox" in Japanese.
 - Serial console (COM1 <-> host stdin/stdout)
 - Minimal ACPI (MADT / IOAPIC, COM1, virtio-mmio devices)
 - Guest reboot via i8042 (`reboot=k`) and Intel CF9 (`reboot=p`)
+- Guest poweroff via ACPI S5 (`poweroff`)
 - Multi-vCPU (`--cpus`)
 - virtio-blk (raw disk as `/dev/vda`)
 - virtio-net (host TAP backend)

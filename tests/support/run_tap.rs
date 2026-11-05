@@ -106,5 +106,5 @@ fn spawn_and_wait(
         child.stderr.take().expect("stderr"),
         std::sync::Arc::clone(&err),
     );
-    pipe::wait_child(child, out, err, timeout, markers)
+    pipe::wait_child(child, out, err, timeout, markers).0
 }

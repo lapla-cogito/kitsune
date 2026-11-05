@@ -5,6 +5,15 @@ mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
 echo "kitsune-initrd-ok"
+# `kitsune.poweroff` on the kernel cmdline asks pid 1 to enter ACPI S5.
+cmdline=$(cat /proc/cmdline 2>/dev/null || true)
+case " $cmdline " in
+  *" kitsune.poweroff "*)
+    echo "kitsune-poweroff"
+    poweroff -f
+    echo "kitsune-poweroff-returned"
+    ;;
+esac
 # Online CPU count (SMP / MADT bring-up).
 cpus=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)
 echo "kitsune-cpus=$cpus"
