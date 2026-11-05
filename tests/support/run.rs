@@ -5,8 +5,16 @@ mod pipe;
 
 pub use pipe::assert_contains;
 
-/// Run kitsune until `timeout` or all `markers` appear in the combined output.
-pub fn run_until(args: &[&str], timeout: std::time::Duration, markers: &[&str]) -> String {
+/// Run kitsune until `timeout`, all `markers` appear, or the process exits.
+///
+/// Returns the captured output and the child's exit code. The code is `None`
+/// when the child is killed after the markers match or the timeout fires. An
+/// empty `markers` slice waits for the process to exit and keeps that status.
+pub fn run_until(
+    args: &[&str],
+    timeout: std::time::Duration,
+    markers: &[&str],
+) -> (String, Option<i32>) {
     let mut child = std::process::Command::new(pipe::kitsune_bin())
         .args(args)
         .stdin(std::process::Stdio::null())

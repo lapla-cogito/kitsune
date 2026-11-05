@@ -400,9 +400,13 @@ fn run_vcpu_loop(mut vcpu: kvm_ioctls::VcpuFd, ctx: VcpuRunCtx) -> crate::error:
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .bus_write(port, data);
-                    if action == crate::devices::PowerAction::Reset {
-                        request_stop(&ctx);
-                        break;
+                    match action {
+                        crate::devices::PowerAction::Reset
+                        | crate::devices::PowerAction::Shutdown => {
+                            request_stop(&ctx);
+                            break;
+                        }
+                        crate::devices::PowerAction::None => {}
                     }
                 }
             }

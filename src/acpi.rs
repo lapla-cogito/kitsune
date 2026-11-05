@@ -1,4 +1,4 @@
-//! ACPI tables for IOAPIC, serial (COM1), and optional virtio-mmio.
+//! ACPI tables for IOAPIC, serial (COM1), S5 poweroff, and optional virtio-mmio.
 //!
 //! Without MADT/IOAPIC the guest stays in virtual-wire mode and never
 //! receives irqfd-injected GSIs, so the serial console cannot accept input.
@@ -59,6 +59,7 @@ pub fn install_tables(
 
     // --- DSDT (AML body) -------------------------------------------------
     let mut aml = Vec::new();
+    append_s5(&mut aml);
     // COM1 is required under HwReducedAcpi so userspace can use the 16550
     // (kernel printk still works via the polled console path alone).
     append_com1_device(&mut aml);
@@ -75,10 +76,13 @@ pub fn install_tables(
     // --- FADT ------------------------------------------------------------
     // HwReducedAcpi is required for this kernel's virtio-mmio (LNRO0005) path;
     // without it the block device is not discovered.
-    let fadt = acpi_tables::fadt::FADTBuilder::new(OEM_ID, OEM_TABLE_ID, OEM_REVISION)
+    let mut fadt = acpi_tables::fadt::FADTBuilder::new(OEM_ID, OEM_TABLE_ID, OEM_REVISION)
         .dsdt_64(dsdt_addr)
-        .flag(acpi_tables::fadt::Flags::HwReducedAcpi)
-        .finalize();
+        .flag(acpi_tables::fadt::Flags::HwReducedAcpi);
+    // Byte-wide SystemIO registers. Linux uses these only when HW_REDUCED is set.
+    fadt.sleep_control_reg = sleep_gas(crate::devices::SLEEP_CONTROL_PORT);
+    fadt.sleep_status_reg = sleep_gas(crate::devices::SLEEP_STATUS_PORT);
+    let fadt = fadt.finalize();
     let mut fadt_bytes = Vec::new();
     fadt.to_aml_bytes(&mut fadt_bytes);
     let fadt_addr = cursor;
@@ -124,6 +128,24 @@ pub fn install_tables(
     write_bytes(mem, rsdp_addr, &rsdp_bytes)?;
 
     Ok(rsdp_addr)
+}
+
+fn sleep_gas(port: u16) -> acpi_tables::gas::GAS {
+    acpi_tables::gas::GAS::new(
+        acpi_tables::gas::AddressSpace::SystemIo,
+        8,
+        0,
+        acpi_tables::gas::AccessSize::ByteAccess,
+        u64::from(port),
+    )
+}
+
+fn append_s5(out: &mut Vec<u8>) {
+    // Nameseg `_S5_` is the ACPI name `\_S5`. Two integers: SLP_TYPa and SLP_TYPb.
+    let typ_a = crate::devices::SLEEP_TYP_S5;
+    let typ_b = crate::devices::SLEEP_TYP_S5;
+    let package = acpi_tables::aml::Package::new(vec![&typ_a, &typ_b]);
+    acpi_tables::aml::Name::new(acpi_tables::aml::Path::new("\\_S5_"), &package).to_aml_bytes(out);
 }
 
 fn append_com1_device(out: &mut Vec<u8>) {
@@ -249,5 +271,61 @@ mod tests {
         mem.read_slice(&mut b, vm_memory::GuestAddress(super::ACPI_TABLES_BASE))
             .unwrap();
         assert_ne!(a, b);
+    }
+
+    /// FADT offsets from the ACPI 6.x layout (`sleep_control` at `0xF4`).
+    const FADT_SLEEP_CONTROL_OFFSET: usize = 0xf4;
+    const FADT_SLEEP_STATUS_OFFSET: usize = 0x100;
+
+    fn gas_bytes(port: u16) -> [u8; 12] {
+        let mut gas = [0u8; 12];
+        gas[0] = 1; // SystemIO
+        gas[1] = 8; // bit width
+        gas[3] = 1; // byte access
+        let port = port.to_le_bytes();
+        gas[4] = port[0];
+        gas[5] = port[1];
+        gas
+    }
+
+    #[test]
+    fn fadt_advertises_s5_sleep_registers() {
+        let mem = guest_mem(2 * 1024 * 1024);
+        super::install_tables(&mem, &[], 1).expect("acpi");
+        let mut buf = vec![0u8; 8192];
+        mem.read_slice(&mut buf, vm_memory::GuestAddress(super::ACPI_TABLES_BASE))
+            .expect("read");
+
+        assert!(
+            buf.windows(4).any(|w| w == b"_S5_"),
+            "DSDT is missing \\_S5"
+        );
+
+        let facp = buf
+            .windows(4)
+            .position(|w| w == b"FACP")
+            .expect("missing FADT");
+        let length = u32::from_le_bytes(buf[facp + 4..facp + 8].try_into().unwrap()) as usize;
+        // ACPI 5.0+ sleep registers start at FADT revision 5 (length >= 0x10C).
+        assert!(
+            length >= 0x10c,
+            "FADT length {length:#x} drops sleep registers"
+        );
+        assert!(facp + length <= buf.len());
+
+        let fadt = &buf[facp..facp + length];
+        let sum = fadt.iter().fold(0u8, |acc, byte| acc.wrapping_add(*byte));
+        assert_eq!(sum, 0, "FADT checksum");
+
+        let ctrl = gas_bytes(crate::devices::SLEEP_CONTROL_PORT);
+        let status = gas_bytes(crate::devices::SLEEP_STATUS_PORT);
+        assert_eq!(
+            &fadt[FADT_SLEEP_CONTROL_OFFSET..FADT_SLEEP_CONTROL_OFFSET + 12],
+            &ctrl
+        );
+        assert_eq!(
+            &fadt[FADT_SLEEP_STATUS_OFFSET..FADT_SLEEP_STATUS_OFFSET + 12],
+            &status
+        );
     }
 }
