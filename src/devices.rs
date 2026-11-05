@@ -3,6 +3,7 @@
 mod legacy_io;
 mod serial;
 mod virtio_blk;
+mod virtio_dev;
 mod virtio_mmio;
 mod virtio_net;
 

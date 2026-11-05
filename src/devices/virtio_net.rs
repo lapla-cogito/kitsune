@@ -87,12 +87,24 @@ struct NetState {
 
 /// Virtio-mmio network device using a host TAP interface.
 pub struct VirtioNet {
-    base: u64,
-    state: std::sync::Arc<std::sync::Mutex<NetState>>,
-    /// Clone of the transport notify EventFd (ioeventfd + software kick / stop).
-    kick: vmm_sys_util::eventfd::EventFd,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    worker: std::sync::Mutex<Option<std::thread::JoinHandle<crate::error::Result<()>>>>,
+    dev: super::virtio_dev::VirtioDev<NetState, crate::error::Result<()>>,
+}
+
+impl super::virtio_dev::VirtioState for NetState {
+    fn mmio(&self) -> &super::virtio_mmio::VirtioMmio {
+        &self.mmio
+    }
+
+    fn mmio_mut(&mut self) -> &mut super::virtio_mmio::VirtioMmio {
+        &mut self.mmio
+    }
+
+    fn copy_config(&self, dest: &mut [u8]) -> usize {
+        let cfg = config_space(&self.mac);
+        let n = cfg.len().min(dest.len());
+        dest[..n].copy_from_slice(&cfg[..n]);
+        cfg.len()
+    }
 }
 
 impl VirtioNet {
@@ -111,22 +123,15 @@ impl VirtioNet {
             features,
             2,
             QUEUE_MAX_SIZE,
-        )
-        .map_err(crate::error::Error::Net)?;
+        )?;
         mmio.register_irq(vm, VIRTIO_NET_IRQ)
             .map_err(crate::error::Error::KvmIoctl)?;
         mmio.register_ioeventfds(vm)
             .map_err(crate::error::Error::KvmIoctl)?;
 
-        // Same EventFd KVM signals on QueueNotify (ioeventfd) and we use for stop.
-        let kick = mmio
-            .notify_fd()
-            .try_clone()
-            .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-
-        Ok(Self {
-            base: VIRTIO_NET_MMIO_BASE,
-            state: std::sync::Arc::new(std::sync::Mutex::new(NetState {
+        let dev = super::virtio_dev::VirtioDev::new(
+            VIRTIO_NET_MMIO_BASE,
+            NetState {
                 mmio,
                 tap,
                 mac,
@@ -134,41 +139,37 @@ impl VirtioNet {
                 tx_scratch: Vec::with_capacity(MAX_FRAME),
                 pending_tx: None,
                 pending_rx_len: None,
-            })),
-            kick,
-            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            worker: std::sync::Mutex::new(None),
-        })
+            },
+        )?;
+        Ok(Self { dev })
     }
 
     /// Start the TAP/queue worker.
     pub fn start_worker(&self, mem: vm_memory::GuestMemoryMmap<()>) -> crate::error::Result<()> {
-        let mut slot = self.worker.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_some() {
+        let Some(reservation) = self.dev.reserve() else {
             return Ok(());
-        }
+        };
 
-        self.stop.store(false, std::sync::atomic::Ordering::SeqCst);
-        let state = std::sync::Arc::clone(&self.state);
+        let state = self.dev.state();
         let kick = self
-            .kick
-            .try_clone()
+            .dev
+            .clone_kick()
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-        let stop = std::sync::Arc::clone(&self.stop);
+        let stop = self.dev.stop_flag();
+        self.dev.clear_stop();
 
         let handle = std::thread::Builder::new()
             .name("virtio-net".into())
             .spawn(move || worker_loop(state, kick, mem, stop))
             .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-        *slot = Some(handle);
+        reservation.commit(handle);
         Ok(())
     }
 
     /// Stop the worker and wait for it to exit.
     pub fn stop_worker(&self) -> crate::error::Result<()> {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.kick.write(1);
-        let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        self.dev.request_stop();
+        let Some(handle) = self.dev.take_worker() else {
             return Ok(());
         };
         match handle.join() {
@@ -181,13 +182,11 @@ impl VirtioNet {
     }
 
     pub fn handles(&self, addr: u64) -> bool {
-        (self.base..self.base + super::virtio_mmio::MMIO_SIZE).contains(&addr)
+        self.dev.handles(addr)
     }
 
     pub fn read(&self, addr: u64, data: &mut [u8]) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = config_space(&state.mac);
-        state.mmio.read(addr, data, &cfg);
+        self.dev.read(addr, data);
     }
 
     pub fn write(
@@ -196,25 +195,7 @@ impl VirtioNet {
         data: &[u8],
         mem: &vm_memory::GuestMemoryMmap<()>,
     ) -> crate::error::Result<()> {
-        let notify = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state
-                .mmio
-                .write(addr, data, mem)
-                .map_err(crate::error::Error::Net)?
-        };
-        if notify.is_some() {
-            self.kick
-                .write(1)
-                .map_err(|e| crate::error::Error::Net(e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for VirtioNet {
-    fn drop(&mut self) {
-        let _ = self.stop_worker();
+        self.dev.write(addr, data, mem)
     }
 }
 
@@ -328,10 +309,7 @@ fn process_net_once(
     }
 
     if need_irq {
-        guard
-            .mmio
-            .signal_used_queue()
-            .map_err(crate::error::Error::Net)?;
+        guard.mmio.signal_used_queue()?;
     }
     match first_err {
         Some(e) => Err(e),

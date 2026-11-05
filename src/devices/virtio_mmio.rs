@@ -69,18 +69,23 @@ impl VirtioMmio {
         device_features: u64,
         num_queues: usize,
         queue_max_size: u16,
-    ) -> Result<Self, String> {
+    ) -> crate::error::Result<Self> {
         if num_queues == 0 {
-            return Err("virtio-mmio requires at least one queue".into());
+            return Err(crate::error::Error::Virtio(
+                "virtio-mmio requires at least one queue".into(),
+            ));
         }
-        let irq_fd =
-            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).map_err(|e| e.to_string())?;
-        let notify_fd =
-            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).map_err(|e| e.to_string())?;
+        let irq_fd = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| crate::error::Error::Virtio(e.to_string()))?;
+        let notify_fd = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| crate::error::Error::Virtio(e.to_string()))?;
 
         let mut queues = Vec::with_capacity(num_queues);
         for _ in 0..num_queues {
-            queues.push(virtio_queue::Queue::new(queue_max_size).map_err(|e| e.to_string())?);
+            queues.push(
+                virtio_queue::Queue::new(queue_max_size)
+                    .map_err(|e| crate::error::Error::Virtio(e.to_string()))?,
+            );
         }
 
         Ok(Self {
@@ -151,15 +156,17 @@ impl VirtioMmio {
         addr: u64,
         data: &[u8],
         mem: &vm_memory::GuestMemoryMmap<()>,
-    ) -> Result<Option<u32>, String> {
+    ) -> crate::error::Result<Option<u32>> {
         let offset = addr - self.base;
         let value = read_le(data);
         self.write_reg(offset, value, mem)
     }
 
-    pub fn signal_used_queue(&mut self) -> Result<(), String> {
+    pub fn signal_used_queue(&mut self) -> crate::error::Result<()> {
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
-        self.irq_fd.write(1).map_err(|e| e.to_string())?;
+        self.irq_fd
+            .write(1)
+            .map_err(|e| crate::error::Error::Virtio(e.to_string()))?;
         Ok(())
     }
 
@@ -214,7 +221,7 @@ impl VirtioMmio {
         offset: u64,
         value: u32,
         mem: &vm_memory::GuestMemoryMmap<()>,
-    ) -> Result<Option<u32>, String> {
+    ) -> crate::error::Result<Option<u32>> {
         match offset {
             REG_DEVICE_FEATURES_SEL => self.device_features_sel = value,
             REG_DRIVER_FEATURES => match self.driver_features_sel {
