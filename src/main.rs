@@ -25,6 +25,10 @@ enum Command {
         #[arg(long, requires = "kernel")]
         tap: Option<String>,
 
+        /// virtio-vsock guest CID and host Unix socket (`CID:PATH`, CID >= 3)
+        #[arg(long, requires = "kernel", value_name = "CID:PATH")]
+        vsock: Option<String>,
+
         /// Kernel command line
         #[arg(long, default_value = kitsune::DEFAULT_KERNEL_CMDLINE)]
         cmdline: String,
@@ -74,6 +78,7 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             initrd,
             block,
             tap,
+            vsock,
             cmdline,
             flat_binary,
             memory,
@@ -109,6 +114,13 @@ fn run(cli: Cli) -> kitsune::Result<()> {
             if let Some(tap) = tap.as_ref() {
                 vmm.add_net_device(tap)?;
             }
+            if let Some(vsock) = vsock.as_deref() {
+                let Some((cid, path)) = split_vsock(vsock) else {
+                    eprintln!("error: --vsock must be CID:PATH with CID >= 3");
+                    std::process::exit(2);
+                };
+                vmm.add_vsock_device(cid, std::path::Path::new(path))?;
+            }
 
             if let Some(kernel) = kernel {
                 let cmdline = kitsune::build_kernel_cmdline(
@@ -117,6 +129,7 @@ fn run(cli: Cli) -> kitsune::Result<()> {
                         initrd: initrd.is_some(),
                         block: block.is_some(),
                         tap: tap.is_some(),
+                        vsock: vsock.is_some(),
                     },
                 );
                 let boot = kitsune::KernelBootConfig {
@@ -134,4 +147,15 @@ fn run(cli: Cli) -> kitsune::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Split `CID:PATH`. The path may itself contain colons.
+fn split_vsock(spec: &str) -> Option<(u64, &str)> {
+    let (cid, path) = spec.split_once(':')?;
+    let cid = cid.parse().ok()?;
+    if path.is_empty() {
+        None
+    } else {
+        Some((cid, path))
+    }
 }

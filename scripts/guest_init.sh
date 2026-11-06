@@ -150,4 +150,13 @@ if [ -d /sys/class/net/eth0 ]; then
     echo "kitsune-net-bulk-fail"
   fi
 fi
+case " $cmdline " in
+  *" kitsune.vsock "*)
+    if [ -x /bin/kitsune-vsock ]; then
+      /bin/kitsune-vsock
+    else
+      echo "kitsune-vsock-missing"
+    fi
+    ;;
+esac
 while true; do sleep 3600; done

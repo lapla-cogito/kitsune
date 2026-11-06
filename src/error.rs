@@ -67,6 +67,9 @@ pub enum Error {
     #[error("network device error: {0}")]
     Net(String),
 
+    #[error("vsock device error: {0}")]
+    Vsock(String),
+
     #[error("virtio transport error: {0}")]
     Virtio(String),
 

@@ -3,7 +3,7 @@
 /// Stack buffer passed to `VirtioState::copy_config`.
 const CONFIG_CAP: usize = 64;
 
-pub(in crate::devices) trait VirtioState: Send {
+pub(crate) trait VirtioState: Send {
     fn mmio(&self) -> &crate::devices::virtio_mmio::VirtioMmio;
     fn mmio_mut(&mut self) -> &mut crate::devices::virtio_mmio::VirtioMmio;
     fn copy_config(&self, dest: &mut [u8]) -> usize;
@@ -15,13 +15,13 @@ enum WorkerSlot<T> {
     Running(std::thread::JoinHandle<T>),
 }
 
-pub(in crate::devices) struct WorkerReservation<T> {
+pub(crate) struct WorkerReservation<T> {
     slot: std::sync::Arc<std::sync::Mutex<WorkerSlot<T>>>,
     active: bool,
 }
 
 impl<T> WorkerReservation<T> {
-    pub(in crate::devices) fn commit(mut self, handle: std::thread::JoinHandle<T>) {
+    pub(crate) fn commit(mut self, handle: std::thread::JoinHandle<T>) {
         let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         *guard = WorkerSlot::Running(handle);
         self.active = false;
@@ -40,7 +40,7 @@ impl<T> Drop for WorkerReservation<T> {
     }
 }
 
-pub(in crate::devices) struct VirtioDev<S, T: Send + 'static> {
+pub(crate) struct VirtioDev<S, T: Send + 'static> {
     base: u64,
     state: std::sync::Arc<std::sync::Mutex<S>>,
     kick: vmm_sys_util::eventfd::EventFd,
@@ -49,7 +49,7 @@ pub(in crate::devices) struct VirtioDev<S, T: Send + 'static> {
 }
 
 impl<S: VirtioState, T: Send + 'static> VirtioDev<S, T> {
-    pub(in crate::devices) fn new(base: u64, state: S) -> crate::error::Result<Self> {
+    pub(crate) fn new(base: u64, state: S) -> crate::error::Result<Self> {
         let kick = state
             .mmio()
             .notify_fd()
@@ -64,26 +64,26 @@ impl<S: VirtioState, T: Send + 'static> VirtioDev<S, T> {
         })
     }
 
-    pub(in crate::devices) fn range(&self) -> std::ops::Range<u64> {
+    pub(crate) fn range(&self) -> std::ops::Range<u64> {
         self.base..self.base + super::virtio_mmio::MMIO_SIZE
     }
 
-    pub(in crate::devices) fn handles(&self, addr: u64) -> bool {
+    pub(crate) fn handles(&self, addr: u64) -> bool {
         self.range().contains(&addr)
     }
 
-    pub(in crate::devices) fn state(&self) -> std::sync::Arc<std::sync::Mutex<S>> {
+    pub(crate) fn state(&self) -> std::sync::Arc<std::sync::Mutex<S>> {
         std::sync::Arc::clone(&self.state)
     }
 
-    pub(in crate::devices) fn read(&self, addr: u64, data: &mut [u8]) {
+    pub(crate) fn read(&self, addr: u64, data: &mut [u8]) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut raw = [0u8; CONFIG_CAP];
         let n = state.copy_config(&mut raw).min(raw.len());
         state.mmio().read(addr, data, &raw[..n]);
     }
 
-    pub(in crate::devices) fn write(
+    pub(crate) fn write(
         &self,
         addr: u64,
         data: &[u8],
@@ -103,19 +103,19 @@ impl<S: VirtioState, T: Send + 'static> VirtioDev<S, T> {
 }
 
 impl<S, T: Send + 'static> VirtioDev<S, T> {
-    pub(in crate::devices) fn clone_kick(&self) -> std::io::Result<vmm_sys_util::eventfd::EventFd> {
+    pub(crate) fn clone_kick(&self) -> std::io::Result<vmm_sys_util::eventfd::EventFd> {
         self.kick.try_clone()
     }
 
-    pub(in crate::devices) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.stop)
     }
 
-    pub(in crate::devices) fn clear_stop(&self) {
+    pub(crate) fn clear_stop(&self) {
         self.stop.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(in crate::devices) fn reserve(&self) -> Option<WorkerReservation<T>> {
+    pub(crate) fn reserve(&self) -> Option<WorkerReservation<T>> {
         let slot = std::sync::Arc::clone(&self.worker);
         let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(*guard, WorkerSlot::Idle) {
@@ -126,12 +126,12 @@ impl<S, T: Send + 'static> VirtioDev<S, T> {
         Some(WorkerReservation { slot, active: true })
     }
 
-    pub(in crate::devices) fn request_stop(&self) {
+    pub(crate) fn request_stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.kick.write(1);
     }
 
-    pub(in crate::devices) fn take_worker(&self) -> Option<std::thread::JoinHandle<T>> {
+    pub(crate) fn take_worker(&self) -> Option<std::thread::JoinHandle<T>> {
         loop {
             let mut guard = self.worker.lock().unwrap_or_else(|e| e.into_inner());
             match std::mem::replace(&mut *guard, WorkerSlot::Idle) {

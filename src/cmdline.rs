@@ -6,6 +6,7 @@ pub struct KernelCmdlineOpts {
     pub initrd: bool,
     pub block: bool,
     pub tap: bool,
+    pub vsock: bool,
 }
 
 /// Build the final kernel command line from a user-supplied base string.
@@ -42,6 +43,20 @@ pub fn build_kernel_cmdline(base: &str, opts: KernelCmdlineOpts) -> String {
         if !cmdline.contains(&format!(
             "virtio_mmio.device=4K@{:#x}:",
             crate::devices::VirtioNet::MMIO_BASE
+        )) {
+            push_token(&mut cmdline, &token);
+        }
+    }
+
+    if opts.vsock {
+        let token = format!(
+            "virtio_mmio.device=4K@{:#x}:{}",
+            crate::devices::VirtioVsock::MMIO_BASE,
+            crate::devices::VirtioVsock::IRQ,
+        );
+        if !cmdline.contains(&format!(
+            "virtio_mmio.device=4K@{:#x}:",
+            crate::devices::VirtioVsock::MMIO_BASE
         )) {
             push_token(&mut cmdline, &token);
         }
@@ -121,5 +136,17 @@ mod tests {
             },
         );
         assert!(out.contains("virtio_mmio.device=4K@0xd0001000:6"));
+    }
+
+    #[test]
+    fn vsock_adds_mmio() {
+        let out = build_kernel_cmdline(
+            "console=ttyS0",
+            KernelCmdlineOpts {
+                vsock: true,
+                ..KernelCmdlineOpts::default()
+            },
+        );
+        assert!(out.contains("virtio_mmio.device=4K@0xd0002000:7"));
     }
 }
