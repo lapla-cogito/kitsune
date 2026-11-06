@@ -14,6 +14,7 @@ A KVM-based VMM written in Rust. Kitsune means "Fox" in Japanese.
 - Multi-vCPU (`--cpus`)
 - virtio-blk (raw disk as `/dev/vda`)
 - virtio-net (host TAP backend)
+- virtio-vsock (host Unix socket, stream sockets)
 
 ## Requirements
 
@@ -162,6 +163,7 @@ kitsune run --flat-binary <path> [--load-addr N] [--entry N]
 | `--initrd` | Initial ramdisk | - |
 | `--block` | Raw disk as virtio-blk (`/dev/vda`) | - |
 | `--tap` | Host TAP interface for virtio-net (e.g. `tap0`) | - |
+| `--vsock` | virtio-vsock `CID:PATH` (CID >= 3). Host connects to `PATH` and sends `CONNECT <port>\n`. Guest connections to CID 2 port N arrive on `PATH_N` | - |
 | `--cmdline` | Kernel command line | `console=ttyS0 reboot=k panic=1 pci=off nomodule` |
 | `--memory` | Guest RAM in MiB (kernel boot needs >= 32. Max 3328 so RAM ends at or before virtio-mmio at `0xd0000000`) | `256` |
 | `--cpus` | Number of guest vCPUs (1–32; flat binary requires 1) | `1` |
@@ -170,7 +172,7 @@ kitsune run --flat-binary <path> [--load-addr N] [--entry N]
 
 When `--initrd` is set and the cmdline has no `rdinit=`, kitsune appends `rdinit=/init`.  
 Kernel boots always get minimal ACPI (MADT/IOAPIC + COM1).  
-With `--block` / `--tap`, matching virtio-mmio devices are advertised in ACPI (and `virtio_mmio.device=` tokens are added for older kernels).  
+With `--block` / `--tap` / `--vsock`, matching virtio-mmio devices are advertised in ACPI (and `virtio_mmio.device=` tokens are added for older kernels).  
 With `--block`, `root=/dev/vda rw` is appended if no `root=` is present.
 
 Guest COM1 (`0x3f8`) is wired to the host stdin/stdout. Do not redirect stdio if you need an interactive shell.

@@ -4,6 +4,7 @@
 pub(crate) enum MmioKind {
     Block,
     Net,
+    Vsock,
 }
 
 /// Device the vCPU loop can service without knowing its concrete type.

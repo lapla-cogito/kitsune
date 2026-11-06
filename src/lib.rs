@@ -21,6 +21,7 @@ pub use config::MAX_VCPUS;
 pub use config::VmmConfig;
 pub use devices::VirtioBlock;
 pub use devices::VirtioNet;
+pub use devices::VirtioVsock;
 pub use error::Error;
 pub use error::Result;
 pub use memory::GUEST_RAM_END;

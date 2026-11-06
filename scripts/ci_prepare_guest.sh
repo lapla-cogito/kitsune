@@ -7,8 +7,9 @@ mkdir -p "$OUT"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUEST_INIT="${SCRIPT_DIR}/guest_init.sh"
-if [[ ! -f "$GUEST_INIT" ]]; then
-  echo "error: missing $GUEST_INIT" >&2
+VSOCK_GUEST="${SCRIPT_DIR}/vsock_guest.c"
+if [[ ! -f "$GUEST_INIT" || ! -f "$VSOCK_GUEST" ]]; then
+  echo "error: missing guest init or vsock helper" >&2
   exit 1
 fi
 
@@ -31,6 +32,7 @@ BB="$(command -v busybox)"
 INITRD_HASH="$(
   {
     cat "$GUEST_INIT"
+    cat "$VSOCK_GUEST"
     # Host busybox identity (path + banner); package updates force a rebuild.
     printf 'busybox=%s\n' "$BB"
     "$BB" 2>&1 | head -n1 || true
@@ -45,6 +47,9 @@ if [[ ! -f "$OUT/initrd.img" || ! -f "$OUT/.initrd-$INITRD_HASH" ]]; then
   ln -s busybox "$WORK/bin/sh"
   cp "$GUEST_INIT" "$WORK/init"
   chmod +x "$WORK/init"
+  cc -std=c11 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pie -no-pie -Os \
+    -o "$WORK/bin/kitsune-vsock" "$VSOCK_GUEST"
+  chmod +x "$WORK/bin/kitsune-vsock"
   ( cd "$WORK" && find . | cpio -o -H newc ) | gzip -9 > "$OUT/initrd.img"
   rm -rf "$WORK"
   rm -f "$OUT"/.initrd-*

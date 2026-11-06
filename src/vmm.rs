@@ -150,6 +150,28 @@ impl Vmm {
         Ok(())
     }
 
+    /// Attach a virtio-vsock device.
+    pub fn add_vsock_device(
+        &mut self,
+        guest_cid: u64,
+        uds_path: &std::path::Path,
+    ) -> crate::error::Result<()> {
+        if self
+            .mmio_devices
+            .iter()
+            .any(|dev| dev.kind() == crate::devices::MmioKind::Vsock)
+        {
+            return Err(crate::error::Error::Vsock(
+                "only one vsock device is supported".into(),
+            ));
+        }
+        self.mmio_devices
+            .push(std::sync::Arc::new(crate::devices::VirtioVsock::new(
+                guest_cid, uds_path, &self.vm,
+            )?));
+        Ok(())
+    }
+
     /// Load a flat binary into guest memory and set the real-mode entry point.
     pub fn load_flat_binary(
         &mut self,
